@@ -1,0 +1,612 @@
+﻿{
+  "children": [
+    {
+      "intent": "0. Application Table",
+      "children": [
+        {
+          "tag": "0.1 NAR ID",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Covers NAR details of application.",
+          "keywords": []
+        },
+        {
+          "tag": "0.2 App Name",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Covers Application Name",
+          "keywords": []
+        },
+        {
+          "tag": "0.3 R-Type",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "R-Type",
+          "keywords": []
+        }
+      ]
+    },
+    {
+      "intent": "1. Introduction",
+      "children": [
+        {
+          "tag": "1.1 Purpose, Scope, and Phases of Migration",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Covers overview/scope required by verification; include phased plan table.",
+          "keywords": ["Introduction"]
+        },
+        {
+          "tag": "1.1.a Phase Table",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "derived",
+          "notes": "Include: Phase Number, Approximate Implementation Date, Overview. Keep future phases out-of-scope marker if applicable.",
+          "keywords": []
+        },
+        {
+          "tag": "1.2 Go-live dates",
+          "musthave": false,
+          "goodToHave": false,
+          "source": "derived",
+          "notes": "Tech Go-Live (PROO) and Business Go-Live (PROD) with dates and implementation phase.",
+          "keywords": ["Go-live dates", "Incremental Reviews"]
+        }
+      ]
+    },
+    {
+      "intent": "2. Governance",
+      "children": [
+        {
+          "tag": "2.1 Change History",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "derived",
+          "notes": "Versioned change log improves auditability.",
+          "keywords": ["Change History"]
+        },
+        {
+          "tag": "2.2 Application Stakeholders",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "derived",
+          "notes": "List ITAO, Delegate, Lead SA, Cloud Architect, Technical Lead, PMO, etc., and whether attendance is required for RtB/RtR.",
+          "keywords": ["Application Stakeholders"]
+        },
+        {
+          "tag": "2.3 Design Decisions (ADR Table)",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "notes": "Include Status (P/C), Decision, Rationale (reference opinionated decision trees), and Lifecycle (Design/Execution/Build).",
+          "keywords": ["Design Decisions", "Opinionated Decision Trees", "Container Platform Choices", "RDB decision tree", "Machine types", "CoreMark benchmark", "Certified Architecture"]
+        },
+        {
+          "tag": "2.4 Approval History",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "derived",
+          "notes": "Include Status (P/C), Decision, Rationale (reference opinionated decision trees), and Lifecycle (Design/Execution/Build).",
+          "keywords": ["Approval History"]
+        },
+        {
+          "tag": "2.5 Assumptions/Constraints/Risks",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Explicit Must in checklist; include business/tech constraints, risks, and mitigations.",
+          "keywords": ["Assumptions / Constraints / Risks"]
+        }
+      ]
+    },
+    {
+      "intent": "3. Application Overview",
+      "children": [
+        {
+          "tag": "3.1 Business Functions",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "derived",
+          "notes": "Key functions and journeys; helps CUJ definition.",
+          "keywords": ["Business Functions", "Taxonomy"]
+        },
+        {
+          "tag": "3.1a Functional Requirements (or link to JIRA)",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "verification-table",
+          "notes": "Maintain traceability to JIRA epics/stories if linked.",
+          "keywords": ["Functional Requirements"]
+        },
+        {
+          "tag": "3.2 Quality Attributes/Non-Functional Requirements (NFRs)",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "verification-table",
+          "notes": "Capture target-state NFRs; indicate if changing from as-is.",
+          "keywords": ["Quality Attributes", "NFRs", "Non-Functional Requirements Catalogue"]
+        },
+        {
+          "tag": "3.2.a UAC Rating",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["UAC"]
+        },
+        {
+          "tag": "3.2.b RPO",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "notes": "Max tolerable data loss; replicate from Waltz if applicable.",
+          "keywords": ["RPO", "GCP Soft Failure", "Application Disaster Recovery", "failure modes", "Outages", "DR testing approach"]
+        },
+        {
+          "tag": "3.2.c RTO",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["RTO"]
+        },
+        {
+          "tag": "3.2.d Operating Hours",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Operating Hours"]
+        },
+        {
+          "tag": "3.2.e Availability",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Availability"]
+        },
+        {
+          "tag": "3.2.f Consuming Regions, Types & Location of Users",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Consuming Regions, Types & Location of Users"]
+        },
+        {
+          "tag": "3.2.g Data Residency and Specific Regulatory Requirements",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Data Residency"]
+        },
+        {
+          "tag": "3.2.h Ingress Volume",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Ingress Volume"]
+        },
+        {
+          "tag": "3.2.i Egress Volume",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Egress Volume"]
+        },
+        {
+          "tag": "3.2.j Statefulness",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Statefulness"]
+        },
+        {
+          "tag": "3.2.k Volume of relational OLTP",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Transactional", "Volume of relational OLTP"]
+        },
+        {
+          "tag": "3.2.l Volume of Relational OLAP",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Analytical", "Volume of Relational OLAP"]
+        },
+        {
+          "tag": "3.2.m Volume of Object / Unstructured",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "notes": "Volume of persisted objects/files",
+          "keywords": ["Volume of Object / Unstructured"]
+        },
+        {
+          "tag": "3.2.n Data Retention (NFR)",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "notes": "Business/legal retention requirement at NFR layer (distinct from 5.2 implementation).",
+          "keywords": ["Data retention"]
+        },
+        {
+          "tag": "3.2.o Throughput",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Throughput Targets"]
+        },
+        {
+          "tag": "3.2.p Pipeline Complexity",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Pipeline complexity", "ELT", "ETL"]
+        },
+        {
+          "tag": "3.2.q Internal Users",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "notes": "DB users, or users otherwise authenticated with a corporate DB identity",
+          "keywords": ["Internal Users"]
+        },
+        {
+          "tag": "3.2.r External Users",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["External Users"]
+        },
+        {
+          "tag": "3.2.s Human Interactive Authentication Required",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "notes": "Requirement for any user authentication, authorisation, and MFA",
+          "keywords": ["Human Interactive Authentication Required"]
+        },
+        {
+          "tag": "3.2.t Inter-Application Complexity (upstream downstream interfaces)",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["upstream", "downstream interfaces"]
+        },
+        {
+          "tag": "3.2.u Other project/migration dependencies",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Other project/migration dependencies"]
+        },
+        {
+          "tag": "3.2.v On-premise Latency Sensitivity",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["on-premise Latency Sensitive"]
+        },
+        {
+          "tag": "3.2.w Information Classification",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["GCP Data Classification"]
+        },
+        {
+          "tag": "3.2.x Anticipated release frequency",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Anticipated release frequency"]
+        }
+      ]
+    },
+    {
+      "intent": "4. Technology",
+      "children": [
+        {
+          "tag": "4.1 Overall Architecture (narrative)",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "derived",
+          "notes": "Frame conceptual, logical, physical, and transitions.",
+          "keywords": ["Cloud Architecture Design Familiarisation", "User Journey", "Migration Pathways", "Controls Guidance", "Demand Management"]
+        },
+        {
+          "tag": "4.1.1 Conceptual Architecture Diagram",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Scope-level interactions with upstream/downstream; no internal detail.",
+          "keywords": ["Conceptual Architecture Diagram"]
+        },
+        {
+          "tag": "4.1.2 Logical Architecture Diagram",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Technology-agnostic capabilities; names like 'Data Warehouse' not product names.",
+          "keywords": ["Logical Architecture Diagram"]
+        },
+        {
+          "tag": "4.1.3 Physical Architecture Diagram",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Include products/services, regions/zones, phasing keys.",
+          "keywords": ["DR and Resilience Decision Tree"]
+        },
+        {
+          "tag": "4.1.3.1 Initial Physical Architecture",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Initial architecture"]
+        },
+        {
+          "tag": "4.1.3.2 Interim Phases Physical Architectures",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Interim phased architectures"]
+        },
+        {
+          "tag": "4.1.3.3 Target Physical Architecture",
+          "musthave": true,
+          "goodToHave": true,
+          "source": "derived",
+          "keywords": ["Target architecture"]
+        },
+        {
+          "tag": "4.2 Application Interfaces",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Document in SDA Checklist 'Flows'; ensure label alignment with diagrams.",
+          "keywords": ["SDA Checklist"]
+        },
+        {
+          "tag": "4.3 Application Components",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "notes": "Document in SDA Checklist 'Components'; align labels with diagrams.",
+          "keywords": ["Application Components", "SDA Checklist"]
+        }
+      ]
+    },
+    {
+      "intent": "5. Data",
+      "children": [
+        {
+          "tag": "5.1 Database Migration",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "template-mandatory",
+          "conditions": "Must-have if R-type is Replatform or Rearchitect AND there is an on-prem DB assessed via DMA.",
+          "notes": "Attach DMA report; justify if not migrating an assessed DB.",
+          "keywords": ["Database Migration", "Cloud Database Migration Assessment"]
+        },
+        {
+          "tag": "5.2 Data Retention, Archiving and Housekeeping",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "template-mandatory",
+          "notes": "Template says 'This section is mandatory'; retention per record/non-record, lifecycle, legal holds.",
+          "keywords": ["RCTLDEF0001728", "CDO-GRMO (Records Management) and Global Data Archiving is via CF (Archiving Council)", "Ingested data (eg in GCS)", "Raw data", "Curated analytical data set", "Webapp scraped Data", "Traders Voice Data"]
+        },
+        {
+          "tag": "5.3 Data Model (narrative)",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "conditions": "Mandatory for Rearchitect apps; optional for Replatform/Rehost per template.",
+          "notes": "Verification marks Data model conceptual/logical/physical as Must; in template, logical/physical are enumerated.",
+          "keywords": []
+        },
+        {
+          "tag": "5.3.1 Logical Data Model",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "conditions": "Mandatory for Rearchitect apps per template; otherwise include if available.",
+          "notes": "Provide entity relationships and domain decomposition.",
+          "keywords": ["PB EKYC Cloud Architecture & Design"]
+        },
+        {
+          "tag": "5.3.2 Physical Data Model",
+          "musthave": true,
+          "goodToHave": false,
+          "source": "verification-table",
+          "conditions": "Mandatory for Rearchitect apps per template; otherwise include if available.",
+          "notes": "Provide schemas/tables/columns, partitioning, clustering.",
+          "keywords": ["PB EKYC Cloud Architecture & Design"]
+        },
+        {
+          "tag": "5.4 Data Mastering & Copies",
+          "musthave": false,
+          "goodToHave": true,
+          "source": "template-mandatory",
+          "conditions": "Mandatory for Rearchitect; optional otherwise.",
+          "notes": "Identify master vs copy systems for each entity.",
+          "keywords": []
+        }
+      ]
+    },
+    {
+      "intent": "6. Security (SDA)",
+      "children": [
+        {
+          "tag": "6.1 SDA Process Overview",
+          "musthave": false,
+          "goodToHave": true,
+          "notes": "SDA reviewed by CSO, not Group Architecture. Typically engaged during Design phase and completed in Build phase.",
+          "keywords": []
+        },
+        {
+          "tag": "6.2 SDA References",
+          "musthave": false,
+          "goodToHave": true,
+          "notes": "Includes: Onboarding Guidance, SDA Confluence, Public Library, Control Guidance Page.",
+          "keywords": []
+        },
+        {
+          "tag": "6.3 SDA Conceptual Diagram",
+          "musthave": false,
+          "goodToHave": true,
+          "notes": "Insert SDA conceptual diagram. Use SDA Conceptual Model template or adapt the Physical Architecture diagram following CAD Fam guidance.",
+          "keywords": []
+        },
+        {
+          "tag": "6.4 Supporting SDA Documentation",
+          "musthave": false,
+          "goodToHave": true,
+          "notes": "Attach approved SDA submitted template and associated security diagram in Waltz as a bookmark under 'SDA Template'.",
+          "keywords": []
+        }
+      ]
+    },
+    {
+      "intent": "7. Operational",
+      "children": [
+        {
+          "tag": "7.1 Monitoring and Logging Tooling",
+          "musthave": true,
+          "goodToHave": false,
+          "notes": "Mandatory for all R-types. Capture logging sources, agents, storage buckets, retention, SIEM, metrics tooling.",
+          "children": [
+            {
+              "tag": "7.1.a Infrastructure Monitoring",
+              "musthave": false,
+              "goodToHave": true,
+              "keywords": []
+            },
+            {
+              "tag": "7.1.b Application Monitoring",
+              "musthave": false,
+              "goodToHave": true,
+              "keywords": []
+            },
+            {
+              "tag": "7.1.c Infrastructure Logging",
+              "musthave": false,
+              "goodToHave": true,
+              "keywords": []
+            },
+            {
+              "tag": "7.1.d Application Logging",
+              "musthave": false,
+              "goodToHave": true,
+              "keywords": []
+            },
+            {
+              "tag": "7.1.e Security & Audit Logging/SIEM",
+              "musthave": false,
+              "goodToHave": true,
+              "keywords": []
+            }
+          ]
+        },
+        {
+          "tag": "7.2 SRE",
+          "musthave": true,
+          "goodToHave": false,
+          "notes": "Mandatory for New, Replatform, Rearchitect. Not mandatory for Rehost. Follow DB & Google SRE guidance.",
+          "children": [
+            {
+              "tag": "7.2.1 Critical User Journeys (CUJs)",
+              "musthave": true,
+              "goodToHave": false,
+              "notes": "Describe actor-centric CUJs with phase/iteration.",
+              "keywords": []
+            },
+            {
+              "tag": "7.2.2 Service Level Indicators (SLIs)",
+              "musthave": true,
+              "goodToHave": false,
+              "notes": "Provide SLIs mapped to CUJs with formulas and measurement definitions.",
+              "keywords": []
+            },
+            {
+              "tag": "7.2.3 Service Level Objectives (SLOs)",
+              "musthave": true,
+              "goodToHave": false,
+              "notes": "Define thresholds, measurement periods, and burn-rate alerting.",
+              "keywords": []
+            }
+          ]
+        },
+        {
+          "tag": "7.3 Alerting Channels",
+          "musthave": true,
+          "goodToHave": false,
+          "notes": "Define notification channels for SLO breaches, application alerts, infrastructure alerts.",
+          "children": [
+            {
+              "tag": "7.3.a Application & SLO Alerts",
+              "musthave": true,
+              "goodToHave": false,
+              "keywords": []
+            },
+            {
+              "tag": "7.3.b Infrastructure Alerts",
+              "musthave": true,
+              "goodToHave": false,
+              "keywords": []
+            },
+            {
+              "tag": "7.3.c Additional Alerts and Metrics",
+              "musthave": true,
+              "goodToHave": false,
+              "keywords": []
+            }
+          ]
+        },
+        {
+          "tag": "7.4 Other Required Artefacts",
+          "musthave": false,
+          "goodToHave": true,
+          "notes": "Ops Runbook, Monitoring/Logging/Alerting document, Error Budget Policy. All alerts must link to operational runbook.",
+          "keywords": []
+        },
+        {
+          "tag": "7.5 Backups",
+          "musthave": true,
+          "goodToHave": false,
+          "notes": "Capture backup region, mechanism, trigger, frequency, retention, restore method. Backups archiving.",
+          "keywords": []
+        },
+        {
+          "tag": "7.6 Disaster Recovery",
+          "musthave": false,
+          "goodToHave": true,
+          "notes": "Describe DR strategy, failover, response to scenarios: process crash, hardware failure, zone loss, region loss, upstream/downstream outage.",
+          "keywords": []
+        },
+        {
+          "tag": "7.7 Assumptions / Constraints/Risks",
+          "musthave": false,
+          "goodToHave": true,
+          "notes": "Capture any assumptions, architectural or operational constraints, and risks related to monitoring, logging, alerting, SRE, backup, or DR.",
+          "keywords": []
+        }
+      ]
+    },
+    {
+      "intent": "8. Reference",
+      "children": [
+        {
+          "tag": "8.1 Application Architecture Blueprint and ERI",
+          "musthave": false,
+          "goodToHave": true,
+          "notes": "List of any blueprints, as well as deviations and/or issues/limitations with a blueprint or ERI, in the table below. This can help create demand for changes and additions",
+          "keywords": ["Blueprints", "ERI"]
+        }
+      ]
+    }
+  ]
+}
