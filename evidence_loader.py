@@ -886,7 +886,7 @@ def ingest_evidence_text_file(
 ) -> int:
     """Inserts into vs_evidence.
     
-    Returns inserted row count (best effort via rowcount).
+    Returns inserted row count.
     """
     engine = get_engine()
     inserted = 0
@@ -899,6 +899,7 @@ def ingest_evidence_text_file(
                 :doc_hash, :doc_id, :doc_uri, :page_num, CAST(:embedding AS vector), 
                 :chunk_index, :chunk, :chunk_hash, CAST(:metadata AS jsonb))
         ON CONFLICT (chunk_hash) DO NOTHING
+        RETURNING chunk_hash
     """)
     
     ext = os.path.splitext(file_path)[1].lower()
@@ -915,11 +916,13 @@ def ingest_evidence_text_file(
         "rel_path": os.path.relpath(file_path, root).replace("\\", "/"),
         "file_ext": ext.lstrip("."),
     }
+    chunk_attempts = 0
     
     def _insert_chunks(page_num: Optional[int], chunks: List[str]) -> None:
-        nonlocal inserted
+        nonlocal inserted, chunk_attempts
         if not chunks:
             return
+        chunk_attempts += len(chunks)
         embs = embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT", out_dim=EMBED_DIM)
         with engine.begin() as conn:
             for ci, (ch, emb) in enumerate(zip(chunks, embs)):
@@ -950,14 +953,17 @@ def ingest_evidence_text_file(
                     "chunk_hash": chunk_hash,
                     "metadata": json.dumps(md),
                 })
-                if getattr(res, "rowcount", 0) not in (None, -1) and res.rowcount > 0:
+                if res.first() is not None:
                     inserted += 1
     
     if ext == ".pdf" and pdf_page_aware:
         pages = pdf_pages_text(file_path)  # [(page_num, text)]
+        if not pages:
+            logging.warning(f"[TEXT] No extractable PDF text found in: {file_path}")
         for page_num, page_text in pages:
             chunks = split_text_with_merge(page_text, chunk_size, chunk_overlap, merge_threshold)
             _insert_chunks(page_num, chunks)
+        logging.info(f"[TEXT] Inserted {inserted}/{chunk_attempts} chunks from: {file_path}")
         return inserted
     elif ext == ".docx":
         text_all = docx_text(file_path)
@@ -976,6 +982,10 @@ def ingest_evidence_text_file(
     if text_all:
         chunks = split_text_with_merge(text_all, chunk_size, chunk_overlap, merge_threshold)
         _insert_chunks(None, chunks)
+    else:
+        logging.warning(f"[TEXT] No extractable text found in: {file_path}")
+
+    logging.info(f"[TEXT] Inserted {inserted}/{chunk_attempts} chunks from: {file_path}")
     
     return inserted
 
@@ -1009,6 +1019,7 @@ def ingest_evidence_images_file(
                 :doc_id, :doc_uri, :caption, :page_num, CAST(:embedding AS vector), 
                 :chunk_index, :chunk, :chunk_hash, CAST(:metadata AS jsonb))
         ON CONFLICT (chunk_hash) DO NOTHING
+        RETURNING chunk_hash
     """)
     
     ext = os.path.splitext(file_path)[1].lower()
@@ -1085,7 +1096,7 @@ def ingest_evidence_images_file(
                 "chunk_hash": chunk_hash,
                 "metadata": json.dumps(md),
             })
-            if getattr(res, "rowcount", 0) not in (None, -1) and res.rowcount > 0:
+            if res.first() is not None:
                 inserted += 1
     
     logging.info(f"[IMG] Inserted {inserted}/{len(images)} images from: {file_path}")
