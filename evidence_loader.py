@@ -14,7 +14,8 @@ Key guarantees:
   - NO page snapshots (no synthetic PNGs).
   - Robust source/category derivation from folder layout.
   - Safe purge by nar_id/release_number OR purge-all (and EXIT immediately).
-  - Idempotent via chunk hash (UNIQUE).
+    - Stable doc_hash/doc_id per file and stable chunk_hash per stored row.
+    - Idempotent inserts via chunk_hash and ON CONFLICT (chunk_hash) DO NOTHING.
 
 Examples:
   # Purge only (no ingestion)
@@ -33,6 +34,7 @@ import base64
 import argparse
 import logging
 import atexit
+import re
 from typing import List, Dict, Any, Optional, Tuple, Iterator
 import csv
 
@@ -184,6 +186,25 @@ def _sha_text(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
 
 
+def _sha_parts(*parts: Any) -> str:
+    """Compute SHA-256 over typed, length-delimited parts."""
+    h = hashlib.sha256()
+    for part in parts:
+        if part is None:
+            kind = b"N"
+            payload = b""
+        elif isinstance(part, bytes):
+            kind = b"B"
+            payload = part
+        else:
+            kind = b"T"
+            payload = str(part).encode("utf-8")
+        h.update(kind)
+        h.update(len(payload).to_bytes(8, "big"))
+        h.update(payload)
+    return h.hexdigest()
+
+
 def _vec_literal(vec: List[float]) -> str:
     """Format vector as PostgreSQL pgvector literal."""
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
@@ -227,6 +248,86 @@ def _resolve_file_paths(root: str, paths: List[str]) -> List[str]:
         if not os.path.isfile(abs_path):
             logging.warning(f"[ONLY-FILE] Skipping non-existent file: {abs_path}")
             continue
+
+
+    def _get_column_format_type(table_name: str, column_name: str) -> Optional[str]:
+        """Return PostgreSQL's formatted column type, e.g. vector(1408)."""
+        engine = get_engine()
+        sql = text("""
+            SELECT format_type(a.atttypid, a.atttypmod) AS format_type
+            FROM pg_attribute a
+            JOIN pg_class c ON c.oid = a.attrelid
+            JOIN pg_namespace n ON n.oid = c.relnamespace
+            WHERE c.relname = :table_name
+              AND a.attname = :column_name
+              AND a.attnum > 0
+              AND NOT a.attisdropped
+            ORDER BY CASE WHEN n.nspname = current_schema() THEN 0 ELSE 1 END, n.nspname
+            LIMIT 1
+        """)
+        with engine.connect() as conn:
+            row = conn.execute(sql, {"table_name": table_name, "column_name": column_name}).first()
+        return row[0] if row and row[0] else None
+
+
+    def _parse_vector_dimension(format_type_name: Optional[str]) -> Optional[int]:
+        """Parse a vector(N) type string into its dimension."""
+        if not format_type_name:
+            return None
+        match = re.fullmatch(r"vector\((\d+)\)", format_type_name.strip(), flags=re.IGNORECASE)
+        return int(match.group(1)) if match else None
+
+
+    def _has_unique_chunk_hash_index(table_name: str) -> bool:
+        """Check whether a table has a single-column UNIQUE index/constraint on chunk_hash."""
+        engine = get_engine()
+        sql = text("""
+            SELECT 1
+            FROM pg_index idx
+            JOIN pg_class tbl ON tbl.oid = idx.indrelid
+            JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+            JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS cols(attnum, ord) ON true
+            JOIN pg_attribute attr ON attr.attrelid = tbl.oid AND attr.attnum = cols.attnum
+            WHERE tbl.relname = :table_name
+              AND ns.nspname = current_schema()
+              AND idx.indisunique
+            GROUP BY idx.indexrelid
+            HAVING COUNT(*) = 1 AND max(attr.attname) = 'chunk_hash'
+            LIMIT 1
+        """)
+        with engine.connect() as conn:
+            return conn.execute(sql, {"table_name": table_name}).first() is not None
+
+
+    def validate_runtime_contract(mm_dim: int) -> None:
+        """Fail fast when DB schema and runtime config cannot guarantee idempotent ingestion."""
+        if EMBED_DIM is not None:
+            text_embedding_type = _get_column_format_type(TABLE_EVIDENCE, "embedding")
+            text_embedding_dim = _parse_vector_dimension(text_embedding_type)
+            if text_embedding_dim != EMBED_DIM:
+                raise RuntimeError(
+                    f"{TABLE_EVIDENCE}.embedding expects {text_embedding_type or 'unknown'}, "
+                    f"but {EMBED_MODEL} is configured for dimension {EMBED_DIM}."
+                )
+
+        mm_embedding_type = _get_column_format_type(TABLE_MM_EVIDENCE, "embedding")
+        mm_embedding_dim = _parse_vector_dimension(mm_embedding_type)
+        if mm_embedding_dim != mm_dim:
+            raise RuntimeError(
+                f"{TABLE_MM_EVIDENCE}.embedding expects {mm_embedding_type or 'unknown'}, "
+                f"but VERTEX_MM_DIM is configured for dimension {mm_dim}."
+            )
+
+        missing_indexes = [
+            table_name
+            for table_name in (TABLE_EVIDENCE, TABLE_MM_EVIDENCE)
+            if not _has_unique_chunk_hash_index(table_name)
+        ]
+        if missing_indexes:
+            raise RuntimeError(
+                "Row-level idempotency requires a single-column UNIQUE index or constraint on chunk_hash "
+                f"for: {', '.join(missing_indexes)}."
+            )
         if not abs_path.lower().endswith(ALLOWED_EXTS):
             logging.warning(f"[ONLY-FILE] skipping unsupported file type: {abs_path}")
             continue
@@ -496,10 +597,52 @@ def iter_guidance_files(root: str) -> Iterator[str]:
 
 
 def compute_doc_id(file_path: str) -> str:
-    """Compute doc_id as SHA-256 of file bytes."""
+    """Compute stable file identity as SHA-256 of file bytes."""
     with open(file_path, "rb") as f:
         b = f.read()
     return _sha_bytes(b)
+
+
+def compute_text_chunk_hash(
+    nar_id: str,
+    release_number: str,
+    document_hash: str,
+    page_num: Optional[int],
+    chunk_index: int,
+    chunk_text: str,
+) -> str:
+    """Compute a stable row hash for a text chunk within an ingestion scope."""
+    return _sha_parts(
+        "text",
+        nar_id,
+        release_number,
+        document_hash,
+        page_num,
+        chunk_index,
+        chunk_text,
+    )
+
+
+def compute_image_chunk_hash(
+    nar_id: str,
+    release_number: str,
+    document_hash: str,
+    page_num: Optional[int],
+    chunk_index: int,
+    caption: str,
+    img_bytes: bytes,
+) -> str:
+    """Compute a stable row hash for an image chunk within an ingestion scope."""
+    return _sha_parts(
+        "image",
+        nar_id,
+        release_number,
+        document_hash,
+        page_num,
+        chunk_index,
+        caption,
+        img_bytes,
+    )
 
 
 def compute_doc_uri(
@@ -591,35 +734,6 @@ def extract_docx_images(docx_path: str) -> List[Tuple[int, bytes, str]]:
 
 
 # ============================================================================
-# Dedupe Helpers
-# ============================================================================
-
-def file_already_ingested(
-    doc_id: str,
-    nar_id: str,
-    release_number: str,
-) -> bool:
-    """Checks whether a file (by doc_id) is already ingested for the given nar_id and release_number."""
-    engine = get_engine()
-    sql_text_query = text(f"""
-        SELECT 1 FROM {TABLE_EVIDENCE}
-        WHERE doc_id=:doc_id AND nar_id=:nar_id AND release_number=:rel
-        LIMIT 1
-    """)
-    sql_img_query = text(f"""
-        SELECT 1 FROM {TABLE_MM_EVIDENCE}
-        WHERE doc_id=:doc_id AND nar_id=:nar_id AND release_number=:rel
-        LIMIT 1
-    """)
-    with engine.connect() as conn:
-        if conn.execute(sql_text_query, {"doc_id": doc_id, "nar_id": nar_id, "rel": release_number}).first():
-            return True
-        if conn.execute(sql_img_query, {"doc_id": doc_id, "nar_id": nar_id, "rel": release_number}).first():
-            return True
-    return False
-
-
-# ============================================================================
 # DB Inserts
 # ============================================================================
 
@@ -644,6 +758,7 @@ def ingest_evidence_text_file(
     """
     engine = get_engine()
     inserted = 0
+    document_hash = doc_id
     ins_sql = text(f"""
         INSERT INTO {TABLE_EVIDENCE}
         (id, nar_id, application_name, release_number, rtype, doc_version, doc_hash, 
@@ -651,6 +766,7 @@ def ingest_evidence_text_file(
         VALUES (:id, :nar_id, :application_name, :release_number, :rtype, :doc_version, 
                 :doc_hash, :doc_id, :doc_uri, :page_num, CAST(:embedding AS vector), 
                 :chunk_index, :chunk, :chunk_hash, CAST(:metadata AS jsonb))
+        ON CONFLICT (chunk_hash) DO NOTHING
     """)
     
     ext = os.path.splitext(file_path)[1].lower()
@@ -661,6 +777,7 @@ def ingest_evidence_text_file(
         "application_name": application_name,
         "release_number": release_number,
         "doc_id": doc_id,
+        "doc_hash": document_hash,
         "doc_uri": doc_uri,
         "file_name": os.path.basename(file_path),
         "rel_path": os.path.relpath(file_path, root).replace("\\", "/"),
@@ -676,8 +793,14 @@ def ingest_evidence_text_file(
             for ci, (ch, emb) in enumerate(zip(chunks, embs)):
                 md = dict(common_md)
                 md.update({"page_num": page_num, "chunk_index": ci})
-                doc_hash = _sha_text(f"{doc_id}::{page_num}::{ci}::{ch}")
-                chunk_hash = _sha_text(f"{ci}::{ch}")
+                chunk_hash = compute_text_chunk_hash(
+                    nar_id,
+                    release_number,
+                    document_hash,
+                    page_num,
+                    ci,
+                    ch,
+                )
                 res = conn.execute(ins_sql, {
                     "id": str(uuid.uuid4()),
                     "nar_id": nar_id,
@@ -685,7 +808,7 @@ def ingest_evidence_text_file(
                     "release_number": release_number,
                     "rtype": rtype_text,
                     "doc_version": None,
-                    "doc_hash": doc_hash,
+                    "doc_hash": document_hash,
                     "doc_id": doc_id,
                     "doc_uri": doc_uri,
                     "page_num": page_num,
@@ -744,6 +867,7 @@ def ingest_evidence_images_file(
     """
     engine = get_engine()
     inserted = 0
+    document_hash = doc_id
     ins_sql = text(f"""
         INSERT INTO {TABLE_MM_EVIDENCE}
         (id, nar_id, release_number, rtype, doc_version, doc_hash, doc_id, doc_uri, 
@@ -751,6 +875,7 @@ def ingest_evidence_images_file(
         VALUES (:id, :nar_id, :release_number, :rtype, :doc_version, :doc_hash, 
                 :doc_id, :doc_uri, :caption, :page_num, CAST(:embedding AS vector), 
                 :chunk_index, :chunk, :chunk_hash, CAST(:metadata AS jsonb))
+        ON CONFLICT (chunk_hash) DO NOTHING
     """)
     
     ext = os.path.splitext(file_path)[1].lower()
@@ -760,6 +885,7 @@ def ingest_evidence_images_file(
         "nar_id": nar_id,
         "release_number": release_number,
         "doc_id": doc_id,
+        "doc_hash": document_hash,
         "doc_uri": doc_uri,
         "file_name": os.path.basename(file_path),
         "file_ext": ext.lstrip("."),
@@ -800,16 +926,22 @@ def ingest_evidence_images_file(
                 "chunk_index": chunk_index,
                 "caption": caption,
             })
-            doc_hash = hashlib.sha256(
-                f"{doc_id}::{page_num}::{chunk_index}::{caption}".encode("utf-8") + img_bytes
-            ).hexdigest()
+            chunk_hash = compute_image_chunk_hash(
+                nar_id,
+                release_number,
+                document_hash,
+                page_num,
+                chunk_index,
+                caption,
+                img_bytes,
+            )
             res = conn.execute(ins_sql, {
                 "id": str(uuid.uuid4()),
                 "nar_id": nar_id,
                 "release_number": release_number,
                 "rtype": rtype_image,
                 "doc_version": None,
-                "doc_hash": doc_hash,
+                "doc_hash": document_hash,
                 "doc_id": doc_id,
                 "doc_uri": doc_uri,
                 "caption": caption,
@@ -817,7 +949,7 @@ def ingest_evidence_images_file(
                 "embedding": _vec_literal(vec),
                 "chunk_index": chunk_index,
                 "chunk": None,
-                "chunk_hash": None,
+                "chunk_hash": chunk_hash,
                 "metadata": json.dumps(md),
             })
             if getattr(res, "rowcount", 0) not in (None, -1) and res.rowcount > 0:
@@ -1015,6 +1147,8 @@ def main():
             "ERROR: --root, --nar-id, --application-name, and --release-number "
             "are required for ingestion."
         )
+
+    validate_runtime_contract(args.mm_dim)
     
     uri_prefix = args.uri_prefix.strip() or None
     pdf_page_aware = not args.no_pdf_page_aware
@@ -1069,14 +1203,6 @@ def main():
             continue
         
         doc_id = compute_doc_id(fp)
-        
-        if file_already_ingested(doc_id, args.nar_id, args.release_number):
-            logging.info(
-                f"[SKIP] [DEDUP] File already ingested: nar_id={args.nar_id}, "
-                f"release_number={args.release_number}, doc_id={doc_id[:12]}..., "
-                f"file={rel_path}"
-            )
-            continue
         
         doc_uri = compute_doc_uri(args.root, fp, uri_prefix)
         logging.info(
