@@ -157,6 +157,86 @@ def get_engine() -> sqlalchemy.Engine:
     return _engine
 
 
+def _get_column_format_type(table_name: str, column_name: str) -> Optional[str]:
+    """Return PostgreSQL's formatted column type, e.g. vector(1408)."""
+    engine = get_engine()
+    sql = text("""
+        SELECT format_type(a.atttypid, a.atttypmod) AS format_type
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = :table_name
+          AND a.attname = :column_name
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        ORDER BY CASE WHEN n.nspname = current_schema() THEN 0 ELSE 1 END, n.nspname
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(sql, {"table_name": table_name, "column_name": column_name}).first()
+    return row[0] if row and row[0] else None
+
+
+def _parse_vector_dimension(format_type_name: Optional[str]) -> Optional[int]:
+    """Parse a vector(N) type string into its dimension."""
+    if not format_type_name:
+        return None
+    match = re.fullmatch(r"vector\((\d+)\)", format_type_name.strip(), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def _has_unique_chunk_hash_index(table_name: str) -> bool:
+    """Check whether a table has a single-column UNIQUE index/constraint on chunk_hash."""
+    engine = get_engine()
+    sql = text("""
+        SELECT 1
+        FROM pg_index idx
+        JOIN pg_class tbl ON tbl.oid = idx.indrelid
+        JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+        JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS cols(attnum, ord) ON true
+        JOIN pg_attribute attr ON attr.attrelid = tbl.oid AND attr.attnum = cols.attnum
+        WHERE tbl.relname = :table_name
+          AND ns.nspname = current_schema()
+          AND idx.indisunique
+        GROUP BY idx.indexrelid
+        HAVING COUNT(*) = 1 AND max(attr.attname) = 'chunk_hash'
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        return conn.execute(sql, {"table_name": table_name}).first() is not None
+
+
+def validate_runtime_contract(mm_dim: int) -> None:
+    """Fail fast when DB schema and runtime config cannot guarantee idempotent ingestion."""
+    if EMBED_DIM is not None:
+        text_embedding_type = _get_column_format_type(TABLE_EVIDENCE, "embedding")
+        text_embedding_dim = _parse_vector_dimension(text_embedding_type)
+        if text_embedding_dim != EMBED_DIM:
+            raise RuntimeError(
+                f"{TABLE_EVIDENCE}.embedding expects {text_embedding_type or 'unknown'}, "
+                f"but {EMBED_MODEL} is configured for dimension {EMBED_DIM}."
+            )
+
+    mm_embedding_type = _get_column_format_type(TABLE_MM_EVIDENCE, "embedding")
+    mm_embedding_dim = _parse_vector_dimension(mm_embedding_type)
+    if mm_embedding_dim != mm_dim:
+        raise RuntimeError(
+            f"{TABLE_MM_EVIDENCE}.embedding expects {mm_embedding_type or 'unknown'}, "
+            f"but VERTEX_MM_DIM is configured for dimension {mm_dim}."
+        )
+
+    missing_indexes = [
+        table_name
+        for table_name in (TABLE_EVIDENCE, TABLE_MM_EVIDENCE)
+        if not _has_unique_chunk_hash_index(table_name)
+    ]
+    if missing_indexes:
+        raise RuntimeError(
+            "Row-level idempotency requires a single-column UNIQUE index or constraint on chunk_hash "
+            f"for: {', '.join(missing_indexes)}."
+        )
+
+
 def _shutdown_connector():
     """Cleanup: close Cloud SQL connector."""
     global _connector, _engine
@@ -248,86 +328,6 @@ def _resolve_file_paths(root: str, paths: List[str]) -> List[str]:
         if not os.path.isfile(abs_path):
             logging.warning(f"[ONLY-FILE] Skipping non-existent file: {abs_path}")
             continue
-
-
-    def _get_column_format_type(table_name: str, column_name: str) -> Optional[str]:
-        """Return PostgreSQL's formatted column type, e.g. vector(1408)."""
-        engine = get_engine()
-        sql = text("""
-            SELECT format_type(a.atttypid, a.atttypmod) AS format_type
-            FROM pg_attribute a
-            JOIN pg_class c ON c.oid = a.attrelid
-            JOIN pg_namespace n ON n.oid = c.relnamespace
-            WHERE c.relname = :table_name
-              AND a.attname = :column_name
-              AND a.attnum > 0
-              AND NOT a.attisdropped
-            ORDER BY CASE WHEN n.nspname = current_schema() THEN 0 ELSE 1 END, n.nspname
-            LIMIT 1
-        """)
-        with engine.connect() as conn:
-            row = conn.execute(sql, {"table_name": table_name, "column_name": column_name}).first()
-        return row[0] if row and row[0] else None
-
-
-    def _parse_vector_dimension(format_type_name: Optional[str]) -> Optional[int]:
-        """Parse a vector(N) type string into its dimension."""
-        if not format_type_name:
-            return None
-        match = re.fullmatch(r"vector\((\d+)\)", format_type_name.strip(), flags=re.IGNORECASE)
-        return int(match.group(1)) if match else None
-
-
-    def _has_unique_chunk_hash_index(table_name: str) -> bool:
-        """Check whether a table has a single-column UNIQUE index/constraint on chunk_hash."""
-        engine = get_engine()
-        sql = text("""
-            SELECT 1
-            FROM pg_index idx
-            JOIN pg_class tbl ON tbl.oid = idx.indrelid
-            JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
-            JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS cols(attnum, ord) ON true
-            JOIN pg_attribute attr ON attr.attrelid = tbl.oid AND attr.attnum = cols.attnum
-            WHERE tbl.relname = :table_name
-              AND ns.nspname = current_schema()
-              AND idx.indisunique
-            GROUP BY idx.indexrelid
-            HAVING COUNT(*) = 1 AND max(attr.attname) = 'chunk_hash'
-            LIMIT 1
-        """)
-        with engine.connect() as conn:
-            return conn.execute(sql, {"table_name": table_name}).first() is not None
-
-
-    def validate_runtime_contract(mm_dim: int) -> None:
-        """Fail fast when DB schema and runtime config cannot guarantee idempotent ingestion."""
-        if EMBED_DIM is not None:
-            text_embedding_type = _get_column_format_type(TABLE_EVIDENCE, "embedding")
-            text_embedding_dim = _parse_vector_dimension(text_embedding_type)
-            if text_embedding_dim != EMBED_DIM:
-                raise RuntimeError(
-                    f"{TABLE_EVIDENCE}.embedding expects {text_embedding_type or 'unknown'}, "
-                    f"but {EMBED_MODEL} is configured for dimension {EMBED_DIM}."
-                )
-
-        mm_embedding_type = _get_column_format_type(TABLE_MM_EVIDENCE, "embedding")
-        mm_embedding_dim = _parse_vector_dimension(mm_embedding_type)
-        if mm_embedding_dim != mm_dim:
-            raise RuntimeError(
-                f"{TABLE_MM_EVIDENCE}.embedding expects {mm_embedding_type or 'unknown'}, "
-                f"but VERTEX_MM_DIM is configured for dimension {mm_dim}."
-            )
-
-        missing_indexes = [
-            table_name
-            for table_name in (TABLE_EVIDENCE, TABLE_MM_EVIDENCE)
-            if not _has_unique_chunk_hash_index(table_name)
-        ]
-        if missing_indexes:
-            raise RuntimeError(
-                "Row-level idempotency requires a single-column UNIQUE index or constraint on chunk_hash "
-                f"for: {', '.join(missing_indexes)}."
-            )
         if not abs_path.lower().endswith(ALLOWED_EXTS):
             logging.warning(f"[ONLY-FILE] skipping unsupported file type: {abs_path}")
             continue
