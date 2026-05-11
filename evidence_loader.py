@@ -958,6 +958,7 @@ def ingest_evidence_text_file(
         for page_num, page_text in pages:
             chunks = split_text_with_merge(page_text, chunk_size, chunk_overlap, merge_threshold)
             _insert_chunks(page_num, chunks)
+        return inserted
     elif ext == ".docx":
         text_all = docx_text(file_path)
     elif ext == ".txt":
