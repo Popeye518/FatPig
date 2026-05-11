@@ -13,6 +13,7 @@ import hashlib
 import base64
 import atexit
 import re
+from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 
 # Database & Connectors
@@ -525,6 +526,48 @@ def _normalize_match_text(text_in: str) -> str:
     ).strip()
 
 
+def _normalize_line_text(text_in: str) -> str:
+    """Normalize text while preserving word boundaries for line-based matching."""
+    return re.sub(
+        r"\s+",
+        " ",
+        re.sub(r"[^a-z0-9\s]+", " ", (text_in or "").lower()),
+    ).strip()
+
+
+def _normalize_multiline_text(text_in: str) -> str:
+    """Normalize text line by line while preserving line boundaries."""
+    lines = []
+    for raw_line in re.split(r"\r?\n", text_in or ""):
+        normalized_line = _normalize_line_text(raw_line)
+        if normalized_line:
+            lines.append(normalized_line)
+    return "\n".join(lines)
+
+
+def _tokenize_match_text(text_in: str) -> List[str]:
+    """Tokenize text for loose semantic overlap checks."""
+    return re.findall(r"[a-z0-9]+", (text_in or "").lower())
+
+
+def _load_template_nodes(template_json_path: str) -> List[Dict[str, Any]]:
+    """Load template nodes from either a top-level list or an object with children."""
+    with open(template_json_path, "r", encoding="utf-8") as f:
+        template = json.load(f)
+
+    if isinstance(template, list):
+        return [node for node in template if isinstance(node, dict)]
+
+    if isinstance(template, dict):
+        children = template.get("children")
+        if isinstance(children, list):
+            return [node for node in children if isinstance(node, dict)]
+
+    raise ValueError(
+        "Template JSON must be either a list of intent nodes or an object with a 'children' list."
+    )
+
+
 def topic_alignment_status(
     tag: str,
     semantic_tag: str,
@@ -534,20 +577,21 @@ def topic_alignment_status(
     tag_prefix = extract_tag_prefix(tag)
     if not tag_prefix or not evidence_snippets:
         return None
-    normalized_topic = _normalize_match_text(semantic_tag)
+    normalized_topic = _normalize_line_text(semantic_tag)
     if not normalized_topic:
         return None
     tag_prefix_pattern = re.escape(tag_prefix).replace(r"\.", r"[.\s]+")
+    topic_pattern = re.escape(normalized_topic).replace(r"\ ", r"\s+")
     aligned_pattern = re.compile(
-        rf"(^|[\r\n])\s*({tag_prefix_pattern})(?:[\s:\-]+)({re.escape(normalized_topic)})\b",
+        rf"(^|[\r\n])\s*({tag_prefix_pattern})(?:[\s:\-]+)({topic_pattern})\b",
         flags=re.IGNORECASE,
     )
     topic_line_pattern = re.compile(
-        rf"(^|[\r\n])\s*(?:[A-Za-z]?\d+(?:[\s]+\d+)*(?:[\s]+[a-z])?)(?:[\s:\-]+){re.escape(normalized_topic)}\b",
+        rf"(^|[\r\n])\s*(?:[A-Za-z]?\d+(?:[.\s]+\d+)*(?:\.[a-z])?)(?:[\s:\-]+){topic_pattern}\b",
         flags=re.IGNORECASE,
     )
     normalized_joined = "\n".join(
-        _normalize_match_text(snippet) for snippet in evidence_snippets if snippet
+        _normalize_multiline_text(snippet) for snippet in evidence_snippets if snippet
     )
     if not normalized_joined.strip():
         return None
@@ -717,9 +761,10 @@ def semantic_topic_match_strength(
         "have", "must", "good", "include", "table", "section", "application",
         "overview", "details", "link",
     }
+    evidence_token_set = set(_tokenize_match_text(" ".join(evidence_snippets)))
     semantic_tokens = [
         token
-        for token in _normalize_match_text(semantic_tag).split()
+        for token in _tokenize_match_text(semantic_tag)
         if len(token) > 4 and token not in stop_words
     ]
     if not semantic_tokens:
@@ -727,7 +772,7 @@ def semantic_topic_match_strength(
     token_hits = sum(
         1
         for token in semantic_tokens
-        if re.search(rf"\b{re.escape(token)}\b", joined)
+        if token in evidence_token_set
     )
     required_hits = min(len(semantic_tokens), max(2, (len(semantic_tokens) + 1) // 2))
     return "partial" if token_hits >= required_hits else None
@@ -1000,9 +1045,7 @@ def run_validation(
             f"Ensure VECTOR(dim) matches model output."
         )
     
-    # Load Template JSON
-    with open(template_json_path, "r", encoding="utf-8") as f:
-        template = json.load(f)  # list of intents with children (tags)
+    template_nodes = _load_template_nodes(template_json_path)
     
     # Extract Template PDF text
     if template_pdf_path.lower().endswith(".pdf"):
@@ -1020,7 +1063,7 @@ def run_validation(
     good_met = 0
     
     # Iterate over template
-    for node in template:
+    for node in template_nodes:
         intent_name = (node.get("intent") or "").strip()
         for child in node.get("children", []):
             tag = (child.get("tag") or "").strip()
@@ -1136,13 +1179,17 @@ def run_validation(
                     f"{justification} {topic_note}".strip() if justification else topic_note
                 )
             
-            if tag_1 in ("8.1 nar id", "nar id") and nar_id:
+            if tag_1 in ("0.1 nar id", "8.1 nar id", "nar id") and nar_id:
                 status = "PRESENT"
                 justification = f"NAR ID '{nar_id}' was resolved from evidence."
             
             if tag_1 in ("0.2 app name", "0.2 application name", "app name", "application name") and application_name:
                 status = "PRESENT"
                 justification = f"Application name '{application_name}' was resolved from evidence."
+
+            if tag_1 in ("0.3 r-type", "0.3 r type", "r-type", "r type", "rtype") and rtype:
+                status = "PRESENT"
+                justification = f"R-Type '{rtype}' was provided for validation."
             
             if mreq:
                 must_total += 1
@@ -1227,7 +1274,6 @@ def generate_summary_pdf(
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
-        import pandas as pd
         
         if not (pdf_output_path or "").strip():
             pdf_output_path = "summary_report.pdf"
@@ -1494,7 +1540,7 @@ def generate_summary_pdf(
         story.append(Paragraph(architecture_summary, normal_style))
         story.append(Spacer(1, 12))
         
-        footer_text = f"Report Generated: {pd.Timestamp.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        footer_text = f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         footer_style = ParagraphStyle(
             "FooterStyle",
             parent=styles["Normal"],
