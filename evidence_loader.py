@@ -206,6 +206,57 @@ def _has_unique_chunk_hash_index(table_name: str) -> bool:
         return conn.execute(sql, {"table_name": table_name}).first() is not None
 
 
+def _find_duplicate_chunk_hashes(
+    table_name: str,
+    limit: int = 5,
+) -> List[Tuple[str, int]]:
+    """Return a small sample of duplicate non-null chunk_hash values."""
+    engine = get_engine()
+    sql = text(f"""
+        SELECT chunk_hash, COUNT(*) AS dup_count
+        FROM {table_name}
+        WHERE chunk_hash IS NOT NULL
+        GROUP BY chunk_hash
+        HAVING COUNT(*) > 1
+        ORDER BY dup_count DESC, chunk_hash
+        LIMIT :limit
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"limit": limit}).fetchall()
+    return [(row[0], row[1]) for row in rows if row and row[0]]
+
+
+def _ensure_unique_chunk_hash_index(table_name: str) -> None:
+    """Create the required unique index on chunk_hash when it is missing."""
+    if _has_unique_chunk_hash_index(table_name):
+        return
+
+    duplicates = _find_duplicate_chunk_hashes(table_name)
+    if duplicates:
+        sample = ", ".join(f"{chunk_hash[:12]}... (x{count})" for chunk_hash, count in duplicates)
+        raise RuntimeError(
+            f"Cannot create UNIQUE chunk_hash index for {table_name} because duplicate chunk_hash values already exist. "
+            f"Sample duplicates: {sample}. Clean duplicates or purge the table/scope, then retry."
+        )
+
+    index_name = f"ux_{table_name}_chunk_hash"
+    engine = get_engine()
+    try:
+        with engine.begin() as conn:
+            conn.execute(text(f"CREATE UNIQUE INDEX IF NOT EXISTS {index_name} ON {table_name} (chunk_hash)"))
+    except Exception as exc:
+        raise RuntimeError(
+            f"Failed to create required UNIQUE chunk_hash index '{index_name}' on {table_name}: {exc}"
+        ) from exc
+
+    if not _has_unique_chunk_hash_index(table_name):
+        raise RuntimeError(
+            f"Expected UNIQUE chunk_hash index on {table_name} after creation attempt, but none was detected."
+        )
+
+    logging.info(f"[SCHEMA] Ensured UNIQUE chunk_hash index on {table_name}(chunk_hash).")
+
+
 def validate_runtime_contract(mm_dim: int) -> None:
     """Fail fast when DB schema and runtime config cannot guarantee idempotent ingestion."""
     if EMBED_DIM is not None:
@@ -225,16 +276,8 @@ def validate_runtime_contract(mm_dim: int) -> None:
             f"but VERTEX_MM_DIM is configured for dimension {mm_dim}."
         )
 
-    missing_indexes = [
-        table_name
-        for table_name in (TABLE_EVIDENCE, TABLE_MM_EVIDENCE)
-        if not _has_unique_chunk_hash_index(table_name)
-    ]
-    if missing_indexes:
-        raise RuntimeError(
-            "Row-level idempotency requires a single-column UNIQUE index or constraint on chunk_hash "
-            f"for: {', '.join(missing_indexes)}."
-        )
+    for table_name in (TABLE_EVIDENCE, TABLE_MM_EVIDENCE):
+        _ensure_unique_chunk_hash_index(table_name)
 
 
 def _shutdown_connector():
