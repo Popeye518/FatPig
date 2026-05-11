@@ -206,6 +206,93 @@ def _has_unique_chunk_hash_index(table_name: str) -> bool:
         return conn.execute(sql, {"table_name": table_name}).first() is not None
 
 
+def _quote_ident(identifier: str) -> str:
+    return '"' + identifier.replace('"', '""') + '"'
+
+
+def _find_single_column_unique_constraints(table_name: str, column_name: str) -> List[str]:
+    """Return single-column UNIQUE constraints for a specific column in the current schema."""
+    engine = get_engine()
+    sql = text("""
+        SELECT con.conname
+        FROM pg_constraint con
+        JOIN pg_class tbl ON tbl.oid = con.conrelid
+        JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+        JOIN pg_attribute attr ON attr.attrelid = tbl.oid AND attr.attnum = con.conkey[1]
+        WHERE tbl.relname = :table_name
+          AND ns.nspname = current_schema()
+          AND con.contype = 'u'
+          AND array_length(con.conkey, 1) = 1
+          AND attr.attname = :column_name
+        ORDER BY con.conname
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"table_name": table_name, "column_name": column_name}).fetchall()
+    return [row[0] for row in rows if row and row[0]]
+
+
+def _find_single_column_unique_indexes(table_name: str, column_name: str) -> List[str]:
+    """Return standalone single-column UNIQUE indexes for a specific column in the current schema."""
+    engine = get_engine()
+    sql = text("""
+        SELECT idx_cls.relname
+        FROM pg_index idx
+        JOIN pg_class tbl ON tbl.oid = idx.indrelid
+        JOIN pg_namespace ns ON ns.oid = tbl.relnamespace
+        JOIN pg_class idx_cls ON idx_cls.oid = idx.indexrelid
+        JOIN LATERAL unnest(idx.indkey) WITH ORDINALITY AS cols(attnum, ord) ON true
+        JOIN pg_attribute attr ON attr.attrelid = tbl.oid AND attr.attnum = cols.attnum
+        LEFT JOIN pg_constraint con ON con.conindid = idx.indexrelid
+        WHERE tbl.relname = :table_name
+          AND ns.nspname = current_schema()
+          AND idx.indisunique
+          AND con.oid IS NULL
+        GROUP BY idx.indexrelid, idx_cls.relname
+        HAVING COUNT(*) = 1 AND max(attr.attname) = :column_name
+        ORDER BY idx_cls.relname
+    """)
+    with engine.connect() as conn:
+        rows = conn.execute(sql, {"table_name": table_name, "column_name": column_name}).fetchall()
+    return [row[0] for row in rows if row and row[0]]
+
+
+def _drop_legacy_single_column_uniques(table_name: str, column_name: str) -> None:
+    """Drop obsolete single-column UNIQUE constraints/indexes that conflict with row-level ingestion."""
+    constraint_names = _find_single_column_unique_constraints(table_name, column_name)
+    index_names = _find_single_column_unique_indexes(table_name, column_name)
+    if not constraint_names and not index_names:
+        return
+
+    table_ident = _quote_ident(table_name)
+    try:
+        engine = get_engine()
+        with engine.begin() as conn:
+            for constraint_name in constraint_names:
+                conn.execute(text(
+                    f"ALTER TABLE {table_ident} DROP CONSTRAINT IF EXISTS {_quote_ident(constraint_name)}"
+                ))
+            for index_name in index_names:
+                conn.execute(text(f"DROP INDEX IF EXISTS {_quote_ident(index_name)}"))
+    except Exception as exc:
+        legacy_names = ", ".join(constraint_names + index_names)
+        raise RuntimeError(
+            f"Failed to drop legacy UNIQUE constraint/index on {table_name}({column_name}) [{legacy_names}]: {exc}"
+        ) from exc
+
+    remaining_constraints = _find_single_column_unique_constraints(table_name, column_name)
+    remaining_indexes = _find_single_column_unique_indexes(table_name, column_name)
+    if remaining_constraints or remaining_indexes:
+        legacy_names = ", ".join(remaining_constraints + remaining_indexes)
+        raise RuntimeError(
+            f"Legacy UNIQUE constraint/index still exists on {table_name}({column_name}) after drop attempt: {legacy_names}"
+        )
+
+    logging.info(
+        f"[SCHEMA] Dropped legacy UNIQUE constraint/index on {table_name}({column_name}): "
+        f"{', '.join(constraint_names + index_names)}"
+    )
+
+
 def _find_duplicate_chunk_hashes(
     table_name: str,
     limit: int = 5,
@@ -277,6 +364,8 @@ def validate_runtime_contract(mm_dim: int) -> None:
         )
 
     for table_name in (TABLE_EVIDENCE, TABLE_MM_EVIDENCE):
+        for column_name in ("doc_hash", "doc_id"):
+            _drop_legacy_single_column_uniques(table_name, column_name)
         _ensure_unique_chunk_hash_index(table_name)
 
 
