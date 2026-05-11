@@ -1567,8 +1567,8 @@ def main():
     ap = argparse.ArgumentParser(
         description="Quality-aware Validation using Template JSON + Template PDF Evidence (text+diagrams)"
     )
-    ap.add_argument("-template-json", required=True, help="Path to Template JSON (e.g., Template_V5.json)")
-    ap.add_argument("-template-pdf", required=True, help="Path to Template PDF/DOCX with instructions")
+    ap.add_argument("--template-json", required=True, help="Path to Template JSON (e.g., Template_V5.json)")
+    ap.add_argument("--template-pdf", required=True, help="Path to Template PDF/DOCX with instructions")
     ap.add_argument("--nar-id", required=True)
     ap.add_argument("--application-name", required=True)
     ap.add_argument("--release-number", required=True)
