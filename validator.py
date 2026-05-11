@@ -364,6 +364,50 @@ def mm_embed_image_with_caption(
     return vec
 
 
+def _extract_generated_text(resp: Any) -> str:
+    """Extract generated text from different SDK response shapes."""
+    direct_text = getattr(resp, "output_text", None) or getattr(resp, "text", None)
+    if isinstance(direct_text, str) and direct_text.strip():
+        return direct_text.strip()
+
+    parsed = getattr(resp, "parsed", None)
+    if isinstance(parsed, (dict, list)):
+        return json.dumps(parsed, ensure_ascii=False)
+    if isinstance(parsed, str) and parsed.strip():
+        return parsed.strip()
+
+    candidate_texts: List[str] = []
+    candidates = getattr(resp, "candidates", None)
+    if candidates:
+        for candidate in candidates:
+            content = getattr(candidate, "content", None)
+            parts = getattr(content, "parts", None) if content is not None else None
+            if not parts:
+                continue
+            for part in parts:
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    candidate_texts.append(part_text.strip())
+        if candidate_texts:
+            return "\n".join(candidate_texts)
+
+    if isinstance(resp, dict):
+        if isinstance(resp.get("text"), str) and resp["text"].strip():
+            return resp["text"].strip()
+        for candidate in resp.get("candidates") or []:
+            content = candidate.get("content") if isinstance(candidate, dict) else None
+            parts = content.get("parts") if isinstance(content, dict) else None
+            if not isinstance(parts, list):
+                continue
+            for part in parts:
+                if isinstance(part, dict) and isinstance(part.get("text"), str) and part["text"].strip():
+                    candidate_texts.append(part["text"].strip())
+        if candidate_texts:
+            return "\n".join(candidate_texts)
+
+    return ""
+
+
 def gen_text(prompt: str) -> str:
     """Generate text using LLM."""
     try:
@@ -377,11 +421,12 @@ def gen_text(prompt: str) -> str:
             contents=prompt,
             config=generation_config,
         )
-        return (
-            getattr(resp, "output_text", None)
-            or getattr(resp, "text", "")
-            or ""
-        )
+        generated_text = _extract_generated_text(resp)
+        if not generated_text:
+            logging.warning(
+                f"LLM returned empty content for prompt length {len(prompt)} using model {LLM_MODEL}."
+            )
+        return generated_text
     except Exception as e:
         logging.error(f"LLM generation failed: {e}")
         return ""
@@ -619,6 +664,51 @@ def _resolve_validation_scope_label(
     if min_doc_id and max_doc_id and min_doc_id == max_doc_id:
         return str(min_doc_id)
     return f"ALL_MATCHING_DOCUMENTS ({doc_count} doc_ids)"
+
+
+def _build_architecture_fallback(
+    arch_snips: List[str],
+    architecture_error: Optional[str],
+) -> Dict[str, Any]:
+    """Build a deterministic architecture summary when the model returns unusable output."""
+    evidence_text = _normalize_match_text(" ".join(arch_snips))
+
+    def _has_any(*tokens: str) -> bool:
+        return any(token in evidence_text for token in tokens)
+
+    conceptual_present = _has_any("conceptual", "contextdiagram", "highlevelarchitecture")
+    logical_present = _has_any("logical", "component", "interface", "service", "workflow")
+    physical_present = _has_any("physical", "deployment", "gke", "cloudsql", "subnet", "firewall", "network")
+
+    recommendations: List[str] = []
+    if not conceptual_present:
+        recommendations.append("Add a conceptual architecture view that explains the major business/system domains.")
+    if not logical_present:
+        recommendations.append("Add a logical architecture view with components, interfaces, and key data flows.")
+    if not physical_present:
+        recommendations.append("Add a physical or deployment architecture view with infrastructure placement details.")
+    if architecture_error:
+        recommendations.append("Review validator logs because the model did not return structured architecture JSON.")
+
+    if arch_snips:
+        summary = (
+            f"Architecture summary fallback used because the model response was unavailable. "
+            f"Retrieved {len(arch_snips)} architecture evidence snippet(s) for manual review."
+        )
+    else:
+        summary = (
+            "Architecture summary fallback used because the model response was unavailable and no architecture evidence snippets were retrieved."
+        )
+
+    return {
+        "summary": summary,
+        "conceptual_present": conceptual_present,
+        "logical_present": logical_present,
+        "physical_present": physical_present,
+        "label_alignment_issues": [],
+        "recommendations": recommendations,
+        "validator_error": architecture_error,
+    }
 
 
 def topic_alignment_status(
@@ -1113,10 +1203,6 @@ def run_validation(
         pdf_text = ""
     
     results: List[Dict[str, Any]] = []
-    must_total = 0
-    must_met = 0
-    good_total = 0
-    good_met = 0
     
     # Iterate over template
     for intent_name, child in requirement_nodes:
@@ -1245,16 +1331,6 @@ def run_validation(
                 status = "PRESENT"
                 justification = f"R-Type '{rtype}' was provided for validation."
             
-            if mreq:
-                must_total += 1
-                if status == "PRESENT":
-                    must_met += 1
-            
-            if greq:
-                good_total += 1
-                if status == "PRESENT":
-                    good_met += 1
-            
             results.append({
                 "intent": intent_name,
                 "tag": tag,
@@ -1291,8 +1367,18 @@ def run_validation(
         ),
         response_kind="architecture summary",
     )
+    if architecture_error:
+        arch_json = _build_architecture_fallback(arch_snips, architecture_error)
     
     logging.info(f"arch_json result: {arch_json}")
+
+    if not results:
+        raise RuntimeError("No validation rows were produced from the template. Check template structure and traversal logic.")
+
+    must_total = sum(1 for item in results if item.get("musthave"))
+    must_met = sum(1 for item in results if item.get("musthave") and item.get("status") == "PRESENT")
+    good_total = sum(1 for item in results if item.get("good_to_have"))
+    good_met = sum(1 for item in results if item.get("good_to_have") and item.get("status") == "PRESENT")
     
     scope_label = _resolve_validation_scope_label(
         nar_id=nar_id,
