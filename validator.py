@@ -367,14 +367,13 @@ def mm_embed_image_with_caption(
 def gen_text(prompt: str) -> str:
     """Generate text using LLM."""
     try:
-        contents = [genai_types.content(role="user", parts=[{"text": prompt}])]
         generation_config = genai_types.GenerateContentConfig(
             temperature=0.0,
             max_output_tokens=2192,
         )
         resp = _genai.models.generate_content(
             model=LLM_MODEL,
-            contents=contents,
+            contents=prompt,
             config=generation_config,
         )
         return (
