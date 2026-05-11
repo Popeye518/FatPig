@@ -370,6 +370,7 @@ def gen_text(prompt: str) -> str:
         generation_config = genai_types.GenerateContentConfig(
             temperature=0.0,
             max_output_tokens=2192,
+            response_mime_type="application/json",
         )
         resp = _genai.models.generate_content(
             model=LLM_MODEL,
@@ -565,6 +566,59 @@ def _load_template_nodes(template_json_path: str) -> List[Dict[str, Any]]:
     raise ValueError(
         "Template JSON must be either a list of intent nodes or an object with a 'children' list."
     )
+
+
+def _iter_requirement_nodes(
+    nodes: List[Dict[str, Any]],
+    current_intent: str = "",
+) -> List[Tuple[str, Dict[str, Any]]]:
+    """Flatten template trees into individual requirement nodes with inherited intent."""
+    flattened: List[Tuple[str, Dict[str, Any]]] = []
+    for node in nodes:
+        if not isinstance(node, dict):
+            continue
+        intent_name = (node.get("intent") or current_intent or "").strip()
+        tag = (node.get("tag") or "").strip()
+        has_requirement_fields = any(key in node for key in ("musthave", "goodToHave", "notes", "conditions", "keywords"))
+        if tag and has_requirement_fields:
+            flattened.append((intent_name, node))
+        children = node.get("children")
+        if isinstance(children, list) and children:
+            flattened.extend(_iter_requirement_nodes(children, intent_name))
+    return flattened
+
+
+def _resolve_validation_scope_label(
+    nar_id: str,
+    release_number: str,
+    rtype: str,
+    explicit_doc_id: Optional[str],
+) -> str:
+    """Return a user-friendly validation scope summary."""
+    if explicit_doc_id:
+        return explicit_doc_id
+
+    engine = get_engine()
+    sql = text(f"""
+        SELECT COUNT(DISTINCT doc_id) AS doc_count,
+               MIN(doc_id) AS min_doc_id,
+               MAX(doc_id) AS max_doc_id
+        FROM {TABLE_EVIDENCE}
+        WHERE nar_id=:nar AND release_number=:rel AND rtype=:rtype
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(sql, {"nar": nar_id, "rel": release_number, "rtype": rtype}).first()
+
+    doc_count = int(row[0] or 0) if row else 0
+    min_doc_id = row[1] if row else None
+    max_doc_id = row[2] if row else None
+    if doc_count <= 0:
+        return "NO_MATCHING_DOCUMENTS"
+    if doc_count == 1 and min_doc_id:
+        return str(min_doc_id)
+    if min_doc_id and max_doc_id and min_doc_id == max_doc_id:
+        return str(min_doc_id)
+    return f"ALL_MATCHING_DOCUMENTS ({doc_count} doc_ids)"
 
 
 def topic_alignment_status(
@@ -1045,6 +1099,9 @@ def run_validation(
         )
     
     template_nodes = _load_template_nodes(template_json_path)
+    requirement_nodes = _iter_requirement_nodes(template_nodes)
+    if not requirement_nodes:
+        raise ValueError(f"No requirement nodes found in template JSON: {template_json_path}")
     
     # Extract Template PDF text
     if template_pdf_path.lower().endswith(".pdf"):
@@ -1062,9 +1119,7 @@ def run_validation(
     good_met = 0
     
     # Iterate over template
-    for node in template_nodes:
-        intent_name = (node.get("intent") or "").strip()
-        for child in node.get("children", []):
+    for intent_name, child in requirement_nodes:
             tag = (child.get("tag") or "").strip()
             semantic_tag = semantic_tag_text(tag)
             mreq = bool(child.get("musthave", False))
@@ -1239,13 +1294,20 @@ def run_validation(
     
     logging.info(f"arch_json result: {arch_json}")
     
+    scope_label = _resolve_validation_scope_label(
+        nar_id=nar_id,
+        release_number=release_number,
+        rtype=rtype,
+        explicit_doc_id=effective_doc_id,
+    )
+
     summary = {
         "nar_id": nar_id,
         "application_name": application_name,
         "release_number": release_number,
         "rtype": rtype,
-        "doc_id_scope": effective_doc_id,
-        "doc_hash_scope": effective_doc_id,
+        "doc_id_scope": scope_label,
+        "doc_hash_scope": scope_label,
         "must_have_total": must_total,
         "must_have_coverage_pct": round((must_met / must_total * 100.0), 1) if must_total else 0.0,
         "must_have_met": must_met,
@@ -1348,7 +1410,7 @@ def generate_summary_pdf(
                     fontName="Helvetica-Bold",
                     alignment=0,
                 ))]],
-                colwidths=[500],
+                colWidths=[500],
             )
             tbl.setStyle(TableStyle([
                 ("BACKGROUND", (0, 0), (-1, -1), colors.HexColor("#2d7fa3")),
@@ -1383,7 +1445,7 @@ def generate_summary_pdf(
                 Paragraph(str(rtype), normal_style),
             ],
         ]
-        metadata_table = Table(metadata_table_data, colwidths=[120, 380])
+        metadata_table = Table(metadata_table_data, colWidths=[120, 380])
         metadata_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#e8f1f5")),
             ("BACKGROUND", (1, 0), (1, -1), colors.HexColor("#f9f9f9")),
@@ -1441,7 +1503,7 @@ def generate_summary_pdf(
                 Paragraph(f"<b>{must_have_coverage:.1f}%</b>", small_style),
             ],
         ]
-        metrics_table = Table(metrics_data, colwidths=[80, 80, 160, 80])
+        metrics_table = Table(metrics_data, colWidths=[80, 80, 160, 80])
         metrics_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9eaf7")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
@@ -1475,7 +1537,7 @@ def generate_summary_pdf(
                 Paragraph(f"<b>{good_to_have_coverage:.1f}%</b>", small_style),
             ],
         ]
-        good_metrics_table = Table(good_metrics_data, colwidths=[80, 80, 160, 80])
+        good_metrics_table = Table(good_metrics_data, colWidths=[80, 80, 160, 80])
         good_metrics_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9eaf7")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
@@ -1519,7 +1581,7 @@ def generate_summary_pdf(
                 ),
             ])
         
-        justification_table = Table(table_data, colwidths=[160, 330])
+        justification_table = Table(table_data, colWidths=[160, 330])
         justification_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9eaf7")),
             ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
