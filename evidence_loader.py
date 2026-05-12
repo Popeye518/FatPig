@@ -814,8 +814,8 @@ def pdf_pages_text(pdf_path: str) -> List[Tuple[int, str]]:
                 logging.debug(f"[PDF][TEXT] PyMuPDF failed to extract text from page {i+1} of '{pdf_path}': {exc}")
 
         chosen_text = pypdf_text if len(pypdf_text) >= len(fitz_text) else fitz_text
-        if not chosen_text:
-            page.append((i + 1, chosen_text))
+        if chosen_text:
+            pages.append((i + 1, chosen_text))
     fitz_doc.close()
     return pages
 
@@ -823,13 +823,13 @@ def pdf_pages_text(pdf_path: str) -> List[Tuple[int, str]]:
 def docx_text(docx_path: str) -> str:
     """Extract text from DOCX."""
     doc = DocxDocument(docx_path)
-    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text and (p.text or "").strip()]  
+    paragraphs = [p.text.strip() for p in doc.paragraphs if (p.text or "").strip()]  
     table_lines: List[str] = []
     for table in doc.tables:
         for row in table.rows:
-            cells = [cell.text.strip() for cell in row.cells if cell.text and (cell.text or "").strip()]
+            cells = [cell.text.strip() for cell in row.cells if (cell.text or "").strip()]
             if cells:
-                table_lines.append("\t".join(cells))
+                table_lines.append(" | ".join(cells))
     combined = paragraphs + table_lines
     return "\n".join(combined).strip()
 
