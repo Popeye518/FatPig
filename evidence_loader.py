@@ -795,19 +795,43 @@ def compute_doc_uri(
 
 def pdf_pages_text(pdf_path: str) -> List[Tuple[int, str]]:
     """Extract text from PDF by page."""
-    reader = PdfReader(pdf_path)
     pages: List[Tuple[int, str]] = []
-    for i, pg in enumerate(reader.pages):
-        t = (pg.extract_text() or "").strip()
-        if t:
-            pages.append((i + 1, t))
+    reader = PdfReader(pdf_path)
+    fitz_doc = fitz.open(pdf_path)  # for image extraction later
+    page_count = max(len(reader.pages), len(fitz_doc))
+    for i in range(page_count):
+        pypdf_text = ""
+        fitz_text = ""
+        if i < len(reader.pages):
+            try:
+                pypdf_text = (reader.pages[i].extract_text() or "").strip()
+            except Exception as exc:
+                logging.debug(f"[PDF][TEXT] PyPDF2 failed to extract text from page {i+1} of '{pdf_path}': {exc}")
+        if i < len(fitz_doc):
+            try:
+                fitz_text = (fitz_doc.load_page(i).get_text("text") or "").strip()
+            except Exception as exc:
+                logging.debug(f"[PDF][TEXT] PyMuPDF failed to extract text from page {i+1} of '{pdf_path}': {exc}")
+
+        chosen_text = pypdf_text if len(pypdf_text) >= len(fitz_text) else fitz_text
+        if not chosen_text:
+            page.append((i + 1, chosen_text))
+    fitz_doc.close()
     return pages
 
 
 def docx_text(docx_path: str) -> str:
     """Extract text from DOCX."""
     doc = DocxDocument(docx_path)
-    return "\n".join([p.text for p in doc.paragraphs]).strip()
+    paragraphs = [p.text.strip() for p in doc.paragraphs if p.text and (p.text or "").strip()]  
+    table_lines: List[str] = []
+    for table in doc.tables:
+        for row in table.rows:
+            cells = [cell.text.strip() for cell in row.cells if cell.text and (cell.text or "").strip()]
+            if cells:
+                table_lines.append("\t".join(cells))
+    combined = paragraphs + table_lines
+    return "\n".join(combined).strip()
 
 
 def txt_text(txt_path: str) -> str:
