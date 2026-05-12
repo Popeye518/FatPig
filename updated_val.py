@@ -470,13 +470,12 @@ def parse_json_with_error(s: str) -> Tuple[Dict[str, Any], Optional[str], str]:
             try:
                 parsed = json.loads(extracted)
             except Exception:
-                parsed =
-                _parse_python_style_object(extracted)
+                parsed = _parse_python_style_object(extracted)
             else:
                 cleaned = extracted
         else:
             parsed = _parse_python_style_object(cleaned)
-        if non isinstance(parsed, dict):
+        if not isinstance(parsed, dict):
             return {}, f"JSON parse failed: {exc}", cleaned
     if not isinstance(parsed, dict):
         return {}, f"Expected JSON object, got {type(parsed).__name__}", cleaned
@@ -486,7 +485,7 @@ def _extract_json_object_text(text_in: str) -> str:
     """Extract the largest JSON object substring from the input text."""
     start = text_in.find("{")
     end = text_in.rfind("}")
-    if start == -1 and end == -1 and end <= start:
+    if start == -1 or end == -1 or end <= start:
         return ""
     return text_in[start : end + 1].strip()
 
@@ -494,7 +493,7 @@ def _parse_python_style_object(text_in: str) -> Dict[str, Any]:
     """Attempt to parse a Python-style dict object as a fallback."""
     try:
         parsed = ast.literal_eval(text_in)
-    except Exception :
+    except Exception:
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
@@ -582,7 +581,7 @@ def read_pdf_text(pdf_path: str) -> str:
 
     try:
         reader = PdfReader(pdf_path)
-        pypdf_pages = [ (pg.extract_text() or "").strip() for pg in reader.pages ]
+        pypdf_pages = [ (pg.extract_text() or "") for pg in reader.pages]
     except Exception as exc:
         logging.warning(f"PyPDF2 failed to extract text from '{pdf_path}': {exc}")
 
@@ -605,7 +604,7 @@ def read_pdf_text(pdf_path: str) -> str:
     for index in range (max(len(pypdf_pages), len(fitz_pages))):
         pypdf_text = pypdf_pages[index] if index < len(pypdf_pages) else ""
         fitz_text = fitz_pages[index] if index < len(fitz_pages) else ""
-        chosen = fitz_text if len(fitz_text) >= len(pypdf_text) else pypdf_text
+        chosen = fitz_text if len(fitz_text.strip()) > len(pypdf_text.strip()) else pypdf_text
         merged_pages.append(chosen)
     return "\n".join(merged_pages)
 
@@ -621,6 +620,7 @@ def read_docx_text(docx_path: str) -> str:
     for table in doc.tables:
         for row in table.rows:
             cells = [(cell.text or "").strip() for cell in row.cells]
+            cells = [cell for cell in cells if cell]
             if cells:
                 parts.append(" | ".join(cells))
     return "\n".join(parts)
@@ -664,7 +664,7 @@ def compact_snippets(
     seen = set()
 
     for snippet in snippets:
-        normalized = normalize_match_text(snippet)
+        normalized = _normalize_match_text(snippet)
         if not normalized or normalized in seen:
             continue
 
@@ -863,7 +863,7 @@ def _build_architecture_fallback(
     if architecture_error:
         recommendations.append("Review validator logs because the model did not return structured architecture JSON.")
 
-    if arch_snips:
+    if arch_snips or diagram_refs:
         summary = (
             f"Architecture summary fallback used because the model response was unavailable. "
             f"Retrieved {len(arch_snips)} architecture evidence snippet(s) for manual review."
@@ -1184,7 +1184,7 @@ def semantic_topic_match_strength(
     semantic_tokens : List[str] = []
     for phrase in [semantic_tag] + [k for k in keywords if isinstance(k, str)]:
         for token in _tokenize_match_text(phrase):
-            if len(token) > 4 and token not in stop_words:
+            if len(token) > 4 and token not in stop_words and token not in semantic_tokens:
                 semantic_tokens.append(token)
     if not semantic_tokens:
         return None
