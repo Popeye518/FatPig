@@ -648,7 +648,7 @@ def _parse_python_style_object(text_in: str) -> Dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 def generate_structured_json(prompt: str, response_kind: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    """Generate structured JSON with one repair retry when parsing fails."""
+    """Generate structured JSON with a repair retry for non-empty malformed output."""
     raw_response = gen_text(prompt)
     parsed, error, cleaned = parse_json_with_error(raw_response)
     if error is None:
@@ -656,6 +656,17 @@ def generate_structured_json(prompt: str, response_kind: str) -> Tuple[Dict[str,
 
     if error == "empty model response":
         logging.warning("%s returned empty model response on first attempt.", response_kind)
+        return {
+            "status": "ERROR",
+            "quality": {},
+            "justification": (
+                f"Validator received an empty model response for {response_kind}. "
+                "Review prompt size, model availability, and logs."
+            ),
+            "citations": {},
+            "validator_error": error,
+            "raw_response_excerpt": "",
+        }, error
     else:
         logging.warning("%s JSON parse failed on first attempt: %s", response_kind, error)
 
@@ -695,11 +706,18 @@ def generate_structured_json_with_compact_retry(
     if error is None:
         return parsed, None
 
-    logging.warning(
-        "%s failed after standard retry; trying compact prompt length=%s.",
-        response_kind,
-        len(compact_retry_prompt),
-    )
+    if error == "empty model response":
+        logging.warning(
+            "%s standard prompt returned empty output; trying compact prompt length=%s.",
+            response_kind,
+            len(compact_retry_prompt),
+        )
+    else:
+        logging.warning(
+            "%s failed after standard retry; trying compact prompt length=%s.",
+            response_kind,
+            len(compact_retry_prompt),
+        )
     compact_parsed, compact_error = generate_structured_json(
         compact_retry_prompt,
         response_kind=f"{response_kind} (compact retry)",
