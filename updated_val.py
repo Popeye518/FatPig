@@ -16,6 +16,7 @@ import atexit
 import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
+from xml.sax.saxutils import escape as xml_escape
 
 # Database & Connectors
 import sqlalchemy
@@ -207,6 +208,9 @@ def validate_runtime_contract(mm_dim: int) -> None:
             f"but {EMBED_MODEL} is configured for dimension {EMBED_DIM}."
         )
 
+    if not mm_dim:
+        return
+
     mm_embedding_type = _get_column_format_type(TABLE_MM_EVID, "embedding")
     mm_embedding_dim = _parse_vector_dimension(mm_embedding_type)
     if mm_embedding_dim != mm_dim:
@@ -365,32 +369,167 @@ def mm_embed_image_with_caption(
     return vec
 
 
+def _safe_getattr(value: Any, attr_name: str, default: Any = None) -> Any:
+    """Read SDK attributes without letting property access abort extraction."""
+    try:
+        return getattr(value, attr_name)
+    except Exception:
+        return default
+
+
+def _to_plain_response_data(value: Any) -> Any:
+    """Best-effort conversion of SDK objects into plain dict/list data."""
+    if value is None or isinstance(value, (str, int, float, bool, dict, list, tuple)):
+        return value
+
+    for method_name, kwargs in (
+        ("model_dump", {"exclude_none": True}),
+        ("to_json_dict", {}),
+        ("dict", {}),
+    ):
+        method = _safe_getattr(value, method_name)
+        if not callable(method):
+            continue
+        try:
+            return method(**kwargs)
+        except TypeError:
+            try:
+                return method()
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    try:
+        data = {k: v for k, v in vars(value).items() if not k.startswith("_")}
+    except Exception:
+        data = None
+    return data if data else value
+
+
+def _looks_like_json_payload(text_value: str) -> bool:
+    """Identify candidate strings that look like model JSON output."""
+    stripped = (text_value or "").strip()
+    return (
+        stripped.startswith("{")
+        or stripped.startswith("[")
+        or stripped.startswith("```json")
+        or stripped.startswith("```")
+    )
+
+
+def _collect_response_text_candidates(value: Any, depth: int = 0) -> List[str]:
+    """Recursively collect text payloads from SDK response objects."""
+    if depth > 5 or value is None:
+        return []
+
+    value = _to_plain_response_data(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+
+    if isinstance(value, (list, tuple)):
+        texts: List[str] = []
+        for item in value:
+            texts.extend(_collect_response_text_candidates(item, depth + 1))
+        return texts
+
+    if isinstance(value, dict):
+        for key in ("output_text", "text"):
+            text_value = value.get(key)
+            if isinstance(text_value, str) and text_value.strip():
+                return [text_value.strip()]
+
+        parsed = value.get("parsed")
+        if parsed is not None:
+            parsed = _to_plain_response_data(parsed)
+            if isinstance(parsed, (dict, list)):
+                return [json.dumps(parsed, ensure_ascii=False)]
+            if isinstance(parsed, str) and parsed.strip():
+                return [parsed.strip()]
+
+        for key in ("parts", "content", "candidates"):
+            child_texts = _collect_response_text_candidates(value.get(key), depth + 1)
+            if child_texts:
+                return child_texts
+
+        texts: List[str] = []
+        for child in value.values():
+            texts.extend(_collect_response_text_candidates(child, depth + 1))
+        return texts
+
+    return []
+
+
+def _summarize_generation_response(resp: Any) -> str:
+    """Return compact response metadata for empty-output diagnostics."""
+    payload = _to_plain_response_data(resp)
+    summary_bits = [f"response_type={type(resp).__name__}"]
+    if not isinstance(payload, dict):
+        return ", ".join(summary_bits)
+
+    candidates = payload.get("candidates") or []
+    summary_bits.append(f"candidate_count={len(candidates)}")
+
+    finish_reasons: List[str] = []
+    for candidate in candidates:
+        candidate_payload = _to_plain_response_data(candidate)
+        if not isinstance(candidate_payload, dict):
+            continue
+        finish_reason = candidate_payload.get("finish_reason") or candidate_payload.get("finishReason")
+        if finish_reason:
+            finish_reasons.append(str(finish_reason))
+    if finish_reasons:
+        summary_bits.append(f"finish_reasons={','.join(sorted(set(finish_reasons)))}")
+
+    prompt_feedback = payload.get("prompt_feedback") or payload.get("promptFeedback")
+    prompt_feedback = _to_plain_response_data(prompt_feedback)
+    if isinstance(prompt_feedback, dict):
+        block_reason = prompt_feedback.get("block_reason") or prompt_feedback.get("blockReason")
+        if block_reason:
+            summary_bits.append(f"block_reason={block_reason}")
+
+    return ", ".join(summary_bits)
+
+
 def _extract_generated_text(resp: Any) -> str:
     """Extract generated text from different SDK response shapes."""
-    direct_text = getattr(resp, "output_text", None) or getattr(resp, "text", None)
+    direct_text = _safe_getattr(resp, "output_text") or _safe_getattr(resp, "text")
     if isinstance(direct_text, str) and direct_text.strip():
         return direct_text.strip()
 
-    parsed = getattr(resp, "parsed", None)
+    parsed = _safe_getattr(resp, "parsed")
+    parsed = _to_plain_response_data(parsed)
     if isinstance(parsed, (dict, list)):
         return json.dumps(parsed, ensure_ascii=False)
     if isinstance(parsed, str) and parsed.strip():
         return parsed.strip()
 
     candidate_texts: List[str] = []
-    candidates = getattr(resp, "candidates", None)
+    candidates = _safe_getattr(resp, "candidates")
     if candidates:
         for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            parts = getattr(content, "parts", None) if content is not None else None
+            content = _safe_getattr(candidate, "content")
+            parts = _safe_getattr(content, "parts") if content is not None else None
             if not parts:
+                candidate_texts.extend(
+                    text
+                    for text in _collect_response_text_candidates(candidate)
+                    if _looks_like_json_payload(text)
+                )
                 continue
             for part in parts:
-                part_text = getattr(part, "text", None)
+                part_text = _safe_getattr(part, "text")
                 if isinstance(part_text, str) and part_text.strip():
                     candidate_texts.append(part_text.strip())
+                    continue
+                candidate_texts.extend(
+                    text
+                    for text in _collect_response_text_candidates(part)
+                    if _looks_like_json_payload(text)
+                )
         if candidate_texts:
-            return "\n".join(candidate_texts)
+            return "\n".join(dict.fromkeys(candidate_texts))
 
     if isinstance(resp, dict):
         if isinstance(resp.get("text"), str) and resp["text"].strip():
@@ -406,26 +545,66 @@ def _extract_generated_text(resp: Any) -> str:
         if candidate_texts:
             return "\n".join(candidate_texts)
 
+    fallback_texts = [
+        text
+        for text in _collect_response_text_candidates(resp)
+        if _looks_like_json_payload(text)
+    ]
+    if fallback_texts:
+        return "\n".join(dict.fromkeys(fallback_texts))
+
     return ""
+
+
+def _generate_with_config(prompt: str, generation_config: genai_types.GenerateContentConfig) -> Tuple[str, Any]:
+    """Run a single generation call and return extracted text plus raw response."""
+    resp = _genai.models.generate_content(
+        model=LLM_MODEL,
+        contents=[prompt],
+        config=generation_config,
+    )
+    return _extract_generated_text(resp), resp
 
 
 def gen_text(prompt: str) -> str:
     """Generate text using LLM."""
     try:
-        generation_config = genai_types.GenerateContentConfig(
+        json_generation_config = genai_types.GenerateContentConfig(
             temperature=0.0,
             max_output_tokens=2192,
             response_mime_type="application/json",
         )
-        resp = _genai.models.generate_content(
-            model=LLM_MODEL,
-            contents=prompt,
-            config=generation_config,
+        generated_text, resp = _generate_with_config(
+            prompt,
+            json_generation_config,
         )
-        generated_text = _extract_generated_text(resp)
         if not generated_text:
             logging.warning(
-                f"LLM returned empty content for prompt length {len(prompt)} using model {LLM_MODEL}."
+                "LLM returned empty JSON-mode content for prompt length %s using model %s. %s",
+                len(prompt),
+                LLM_MODEL,
+                _summarize_generation_response(resp),
+            )
+            text_generation_config = genai_types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=2192,
+            )
+            generated_text, fallback_resp = _generate_with_config(
+                prompt,
+                text_generation_config,
+            )
+            if generated_text:
+                logging.info(
+                    "Recovered model output for prompt length %s using plain-text fallback mode.",
+                    len(prompt),
+                )
+                return generated_text
+
+            logging.warning(
+                "LLM returned empty plain-text fallback content for prompt length %s using model %s. %s",
+                len(prompt),
+                LLM_MODEL,
+                _summarize_generation_response(fallback_resp),
             )
         return generated_text
     except Exception as e:
@@ -498,13 +677,27 @@ def _parse_python_style_object(text_in: str) -> Dict[str, Any]:
     return parsed if isinstance(parsed, dict) else {}
 
 def generate_structured_json(prompt: str, response_kind: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    """Generate structured JSON with one repair retry when parsing fails."""
+    """Generate structured JSON with a repair retry for non-empty malformed output."""
     raw_response = gen_text(prompt)
     parsed, error, cleaned = parse_json_with_error(raw_response)
     if error is None:
         return parsed, None
 
-    logging.warning(f"{response_kind} JSON parse failed on first attempt: {error}")
+    if error == "empty model response":
+        logging.warning("%s returned empty model response on first attempt.", response_kind)
+        return {
+            "status": "ERROR",
+            "quality": {},
+            "justification": (
+                f"Validator received an empty model response for {response_kind}. "
+                "Review prompt size, model availability, and logs."
+            ),
+            "citations": {},
+            "validator_error": error,
+            "raw_response_excerpt": "",
+        }, error
+    else:
+        logging.warning("%s JSON parse failed on first attempt: %s", response_kind, error)
 
     repair_prompt = (
         f"{prompt}\n\n"
@@ -532,44 +725,87 @@ def generate_structured_json(prompt: str, response_kind: str) -> Tuple[Dict[str,
         "raw_response_excerpt": repaired_cleaned[:500],
     }, combined_error
 
-def generated_structured_json_with_compact_error(prompt: str, response_kind: str) -> Tuple[Dict[str, Any], Optional[str]]:
-    """Generate structured JSON with compact error reporting."""
+def generate_structured_json_with_compact_retry(
+    prompt: str,
+    compact_retry_prompt: str,
+    response_kind: str,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Generate structured JSON with a second, more compact retry prompt."""
     parsed, error = generate_structured_json(prompt, response_kind=response_kind)
     if error is None:
         return parsed, None
-    
-    logging.warning("%s failed after standard retry; trying compact prompt length=%s.", response_kind, len(compact_retry_prompt),)
-    compact_parsed, compact_error = generate_structured_json(compact_retry_prompt, response_kind=f"{response_kind} (compact retry)",)
+
+    if error == "empty model response":
+        logging.warning(
+            "%s standard prompt returned empty output; trying compact prompt length=%s.",
+            response_kind,
+            len(compact_retry_prompt),
+        )
+    else:
+        logging.warning(
+            "%s failed after standard retry; trying compact prompt length=%s.",
+            response_kind,
+            len(compact_retry_prompt),
+        )
+    compact_parsed, compact_error = generate_structured_json(
+        compact_retry_prompt,
+        response_kind=f"{response_kind} (compact retry)",
+    )
     return compact_parsed, compact_error
 
-def generate_architecture_summary_json(template_pdf_excerpts: str, evidence_snippets: List[str] , diagram_refs : Optional[List[Dict[str, str]]] = None) -> Tuple[Dict[str, Any], Optional[str]]:
-    """Generate architecture summary JSON with error handling."""
+
+def generate_architecture_summary_json(
+    template_pdf_excerpts: str,
+    evidence_snippets: List[str],
+    diagram_refs: Optional[List[Dict[str, str]]] = None,
+) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Generate architecture summary JSON with compact retry handling."""
     diagram_refs = diagram_refs or []
-    diagram_blocks = "\n".join(
-        _truncate_text(f"{ref.get('doc_uri','')}",240) for ref in diagram_refs[:4]
+    diagram_block = "\n".join(
+        _truncate_text(
+            f"{ref.get('caption', '')}: {ref.get('doc_uri', '')}".strip(" :"),
+            240,
+        )
+        for ref in diagram_refs[:4]
+        if ref.get("caption") or ref.get("doc_uri")
     ) or "(None)"
-    primary_snippets = compact_snippets(evidence_snippets, max_snippets=8, max_chars_pre_snippet=900, max_total_chars=6000,
+
+    primary_snippets = compact_snippets(
+        evidence_snippets,
+        max_snippets=8,
+        max_chars_per_snippet=900,
+        max_total_chars=6000,
     )
     primary_prompt = ARCHITECTURE_SUMMARY_PROMPT.format(
-        template_pdf_excerpts=truncate_text(template_pdf_excerpts, 1800) or "(No template PDF excerpts excerpts)",
+        template_pdf_excerpts=_truncate_text(template_pdf_excerpts, 1800)
+        or "(No template PDF excerpts)",
         evidence="\n\n---\n\n".join(primary_snippets) if primary_snippets else "(None)",
-        diagram_blocks=diagram_blocks,
+        diagrams=diagram_block,
     )
-    logging.info(f"Generating architecture summary JSON with primary prompt (length={len(primary_prompt)}).")
 
-    arch_json, architecture_error = generated_structured_json(primary_prompt, response_kind="Architecture Summary",)
-    if architecture_error is None:
-        return arch_json, None
-    
-    retry_snippets= compact_snippets(evidence_snippets, max_snippets=4, max_chars_pre_snippet=450, max_total_chars=1800,)
+    retry_snippets = compact_snippets(
+        evidence_snippets,
+        max_snippets=4,
+        max_chars_per_snippet=450,
+        max_total_chars=1800,
+    )
     retry_prompt = ARCHITECTURE_SUMMARY_PROMPT.format(
-        template_pdf_excerpts=truncate_text(template_pdf_excerpts, 1200) or "(No template PDF excerpts excerpts)",
+        template_pdf_excerpts=_truncate_text(template_pdf_excerpts, 1200)
+        or "(No template PDF excerpts)",
         evidence="\n\n---\n\n".join(retry_snippets) if retry_snippets else "(None)",
-        diagram="\n".join(diagram_block.splitlines()[:2]) or "(None)",
+        diagrams="\n".join(diagram_block.splitlines()[:2]) or "(None)",
     )
-    logging.info(f"Retrying architecture summary JSON generation with compact prompt (length={len(retry_prompt)}).")
 
-    return generated_structured_json(retry_prompt, response_kind="Architecture Summary (compact retry)",)
+    logging.info(
+        "Generating architecture summary JSON with primary prompt length=%s and compact prompt length=%s.",
+        len(primary_prompt),
+        len(retry_prompt),
+    )
+    return generate_structured_json_with_compact_retry(
+        primary_prompt,
+        retry_prompt,
+        response_kind="Architecture Summary",
+    )
 # ============================================================================
 # Document Processing
 # ============================================================================
@@ -589,7 +825,7 @@ def read_pdf_text(pdf_path: str) -> str:
         import fitz  # PyMuPDF
         fitz_doc = fitz.open(pdf_path)
         try:
-            fitz.pages = [(page.get_text("text") or "") for page in fitz_doc]
+            fitz_pages = [(page.get_text("text") or "") for page in fitz_doc]
         finally:
             fitz_doc.close()
     except Exception as exc:
@@ -599,9 +835,9 @@ def read_pdf_text(pdf_path: str) -> str:
     if not pypdf_pages and not fitz_pages:
         logging.error(f"Both PyPDF2 and PyMuPDF failed to extract text from '{pdf_path}'. Returning empty string.")
         return ""
-    
+
     merged_pages: List[str] = []
-    for index in range (max(len(pypdf_pages), len(fitz_pages))):
+    for index in range(max(len(pypdf_pages), len(fitz_pages))):
         pypdf_text = pypdf_pages[index] if index < len(pypdf_pages) else ""
         fitz_text = fitz_pages[index] if index < len(fitz_pages) else ""
         chosen = fitz_text if len(fitz_text.strip()) > len(pypdf_text.strip()) else pypdf_text
@@ -686,6 +922,36 @@ def compact_snippets(
     return compacted
 
 
+_TEMPLATE_PDF_INDEX_CACHE: Dict[str, Tuple[List[str], np.ndarray]] = {}
+
+
+def _get_template_pdf_index(pdf_text: str) -> Tuple[List[str], np.ndarray]:
+    """Build and cache a reusable embedding index for the template PDF."""
+    if not pdf_text.strip():
+        return [], np.empty((0, 0), dtype=np.float32)
+
+    cache_key = hashlib.sha256(pdf_text.encode("utf-8")).hexdigest()
+    cached = _TEMPLATE_PDF_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    chunks = split_text_local(pdf_text)
+    if not chunks:
+        cached = ([], np.empty((0, 0), dtype=np.float32))
+    else:
+        logging.info("Building template PDF embedding index for %s chunk(s).", len(chunks))
+        cached = (
+            chunks,
+            np.array(
+                embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT", out_dim=EMBED_DIM),
+                dtype=np.float32,
+            ),
+        )
+
+    _TEMPLATE_PDF_INDEX_CACHE[cache_key] = cached
+    return cached
+
+
 def _get_bool_flag(node: Dict[str, Any], *keys: str) -> bool:
     """Read a boolean-like template flag from multiple possible key spellings."""
     for key in keys:
@@ -763,6 +1029,14 @@ def _normalize_multiline_text(text_in: str) -> str:
 def _tokenize_match_text(text_in: str) -> List[str]:
     """Tokenize text for loose semantic overlap checks."""
     return re.findall(r"[a-z0-9]+", (text_in or "").lower())
+
+
+MATCH_STOP_WORDS = {
+    "and", "the", "for", "with", "from", "into", "that", "this",
+    "have", "must", "good", "include", "includes", "table", "section",
+    "application", "overview", "details", "link", "keep", "applicable",
+    "diagram",
+}
 
 
 def _load_template_nodes(template_json_path: str) -> List[Dict[str, Any]]:
@@ -880,8 +1154,14 @@ def _build_architecture_fallback(
         "logical_present": logical_present,
         "physical_present": physical_present,
         "label_alignment_issues": [],
-        "diagram_refs": 
-        [_truncate_text(f"(ref.get('caption','')) : : {ref.get('doc_uri','')}", 180) for ref in diagram_refs[:3]],
+        "diagram_refs": [
+            _truncate_text(
+                f"{ref.get('caption', '')}: {ref.get('doc_uri', '')}".strip(" :"),
+                180,
+            )
+            for ref in diagram_refs[:3]
+            if ref.get("caption") or ref.get("doc_uri")
+        ],
         "recommendations": recommendations,
         "validator_error": architecture_error,
     }
@@ -1175,16 +1455,11 @@ def semantic_topic_match_strength(
             normalized_phrases.append(normalized)
     if any(phrase in joined for phrase in normalized_phrases):
         return "exact"
-    stop_words = {
-        "and", "the", "for", "with", "from", "into", "that", "this",
-        "have", "must", "good", "include", "table", "section", "application",
-        "overview", "details", "link", "keep", "applicable",
-    }
     evidence_token_set = set(_tokenize_match_text(" ".join(evidence_snippets)))
     semantic_tokens : List[str] = []
     for phrase in [semantic_tag] + [k for k in keywords if isinstance(k, str)]:
         for token in _tokenize_match_text(phrase):
-            if len(token) > 4 and token not in stop_words and token not in semantic_tokens:
+            if len(token) > 4 and token not in MATCH_STOP_WORDS and token not in semantic_tokens:
                 semantic_tokens.append(token)
     if not semantic_tokens:
         return None
@@ -1209,15 +1484,8 @@ def extract_requirement_phrases(notes: str, conds: str) -> List[str]:
         seen.add(normalized)
         phrases.append(raw)
 
-    include_match = re.search(
-        r"include\s*:\s*(.+?)(?:\.|$)",
-        notes or "",
-        flags=re.IGNORECASE,
-    )
-    if include_match:
-        include_block = include_match.group(1)
-        for part in re.split(r",|;|\band\b", include_block, flags=re.IGNORECASE):
-            add_phrase(part)
+    for item in extract_structured_requirement_items(notes, conds):
+        add_phrase(item)
 
     for text_block in [notes, conds]:
         for part in re.split(r"[.;]\s+", text_block or ""):
@@ -1225,6 +1493,144 @@ def extract_requirement_phrases(notes: str, conds: str) -> List[str]:
                 add_phrase(part)
 
     return phrases[:6]
+
+
+def extract_structured_requirement_items(notes: str, conds: str) -> List[str]:
+    """Extract explicit required items such as table columns or diagram checklist items."""
+    items: List[str] = []
+    seen = set()
+
+    def add_item(value: str) -> None:
+        raw = (value or "").strip(" .;:-")
+        normalized = _normalize_match_text(raw)
+        if not raw or len(normalized) < 4 or normalized in seen:
+            return
+        seen.add(normalized)
+        items.append(raw)
+
+    patterns = [
+        r"\bincludes?\s*:?\s*(.+?)(?:\.|$)",
+        r"\bprovide\s*:?\s*(.+?)(?:\.|$)",
+        r"\blist\s*:?\s*(.+?)(?:\.|$)",
+    ]
+    for text_block in [notes, conds]:
+        for pattern in patterns:
+            for match in re.finditer(pattern, text_block or "", flags=re.IGNORECASE):
+                block = match.group(1)
+                for part in re.split(r",|;|\band\b", block, flags=re.IGNORECASE):
+                    add_item(part)
+
+    return items[:8]
+
+
+def _requirement_item_matches(
+    item: str,
+    normalized_joined: str,
+    token_set: set,
+) -> bool:
+    """Check whether a required item is clearly evidenced in retrieved text."""
+    normalized_item = _normalize_match_text(item)
+    if normalized_item and normalized_item in normalized_joined:
+        return True
+
+    item_tokens = [
+        token
+        for token in _tokenize_match_text(item)
+        if len(token) > 3 and token not in MATCH_STOP_WORDS
+    ]
+    if not item_tokens:
+        return False
+
+    token_hits = sum(1 for token in item_tokens if token in token_set)
+    if len(item_tokens) == 1:
+        return token_hits == 1
+    required_hits = len(item_tokens) if len(item_tokens) <= 2 else len(item_tokens) - 1
+    return token_hits >= required_hits
+
+
+def assess_requirement_item_coverage(
+    required_items: List[str],
+    text_blocks: List[str],
+) -> Dict[str, Any]:
+    """Measure coverage of explicit required items against retrieved evidence."""
+    joined_text = "\n".join(block for block in text_blocks if (block or "").strip())
+    normalized_joined = _normalize_match_text(joined_text)
+    token_set = set(_tokenize_match_text(joined_text))
+    matched_items: List[str] = []
+    missing_items: List[str] = []
+
+    for item in required_items:
+        if _requirement_item_matches(item, normalized_joined, token_set):
+            matched_items.append(item)
+        else:
+            missing_items.append(item)
+
+    total_count = len(required_items)
+    matched_count = len(matched_items)
+    return {
+        "matched_items": matched_items,
+        "missing_items": missing_items,
+        "matched_count": matched_count,
+        "total_count": total_count,
+        "coverage_ratio": round((matched_count / total_count), 3) if total_count else 1.0,
+    }
+
+
+def requirement_items_ready_for_present(coverage: Dict[str, Any]) -> bool:
+    """Require strong coverage for explicit row/column style requirements before PRESENT."""
+    total_count = int(coverage.get("total_count") or 0)
+    matched_count = int(coverage.get("matched_count") or 0)
+    if total_count <= 0:
+        return True
+    if total_count <= 3:
+        return matched_count == total_count
+    return matched_count >= total_count - 1
+
+
+def is_table_like_requirement(
+    tag: str,
+    notes: str,
+    conds: str,
+    source: str,
+    required_items: List[str],
+) -> bool:
+    """Detect requirements that should behave like structured tables/checklists."""
+    haystack = " ".join([tag or "", notes or "", conds or "", source or ""]).lower()
+    if "diagram" in haystack:
+        return False
+    return (
+        "table" in haystack
+        or ("row" in haystack and "column" in haystack)
+        or (source == "verification-table" and len(required_items) >= 2)
+    )
+
+
+def build_diagram_reference_texts(diagram_refs: List[Dict[str, str]]) -> List[str]:
+    """Flatten diagram refs into searchable text."""
+    texts: List[str] = []
+    for ref in diagram_refs:
+        text_value = " ".join(
+            part.strip()
+            for part in [ref.get("caption", ""), ref.get("doc_uri", "")]
+            if (part or "").strip()
+        ).strip()
+        if text_value:
+            texts.append(text_value)
+    return texts
+
+
+def filter_relevant_diagram_refs(
+    semantic_tag: str,
+    keywords: List[str],
+    diagram_refs: List[Dict[str, str]],
+) -> List[Dict[str, str]]:
+    """Prefer diagram refs whose caption or URI aligns with the requested diagram type."""
+    aligned_refs: List[Dict[str, str]] = []
+    for ref in diagram_refs:
+        ref_texts = build_diagram_reference_texts([ref])
+        if semantic_topic_match_strength(semantic_tag, keywords, ref_texts) in ("exact", "partial"):
+            aligned_refs.append(ref)
+    return aligned_refs or diagram_refs
 
 
 def should_promote_semantic_match(
@@ -1269,15 +1675,11 @@ def pick_best_template_snippets_for_tag(
     top_n: int = 3,
 ) -> List[str]:
     """Pick best matching snippets from template PDF using embeddings."""
-    if not pdf_text.strip():
+    chunks, emb_chunks = _get_template_pdf_index(pdf_text)
+    if not chunks or emb_chunks.size == 0:
         return []
-    chunks = split_text_local(pdf_text)
-    if not chunks:
-        return []
-    emb_chunks = embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT", out_dim=EMBED_DIM)
     qv = np.array(embed_query_text(tag_query, out_dim=EMBED_DIM), dtype=np.float32).reshape(1, -1)
-    em = np.array(emb_chunks, dtype=np.float32)
-    sims = cosine_similarity(qv, em)[0]
+    sims = cosine_similarity(qv, emb_chunks)[0]
     idx = np.argsort(-sims)[:top_n]
     return [chunks[i] for i in idx]
 
@@ -1387,6 +1789,38 @@ def retrieve_mm_diagrams(
     return [{"caption": r[0], "doc_uri": r[1]} for r in rows]
 
 
+def retrieve_mm_diagrams_safe(
+    query_text: str,
+    nar_id: str,
+    release_number: str,
+    rtype: str,
+    doc_id: Optional[str],
+    top_n: int = 3,
+    dim: int = MM_DIM,
+) -> List[Dict[str, str]]:
+    """Best-effort multimodal retrieval that degrades to text-only validation."""
+    try:
+        return retrieve_mm_diagrams(
+            query_text=query_text,
+            nar_id=nar_id,
+            release_number=release_number,
+            rtype=rtype,
+            doc_id=doc_id,
+            top_n=top_n,
+            dim=dim,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Multimodal retrieval failed for nar_id=%s, release=%s, rtype=%s, query=%r: %s",
+            nar_id,
+            release_number,
+            rtype,
+            _truncate_text(query_text, 120),
+            exc,
+        )
+        return []
+
+
 # ============================================================================
 # LLM PROMPTS
 # ============================================================================
@@ -1406,11 +1840,15 @@ Judge semantic content, not exact section numbering.
 If the right content appears under a different numbering or heading label (for example 1.2 instead of 1.1), do NOT mark it PARTIAL or MISSING for that reason alone.
 Only mark PARTIAL or MISSING when required content itself is incomplete, generic, contradictory, or absent.
 
+Structured completeness rule:
+If STRUCTURED REQUIREMENT ITEMS are listed, do not mark PRESENT unless the evidence covers those expected rows, columns, or checklist items, not just the general topic.
+
 TAG: {tag}
 INTENT: {intent}
 SEMANTIC TAG: {semantic_tag}
 NOTES: {notes}
 REQUIRED: {required_flag}
+STRUCTURED REQUIREMENT ITEMS: {structured_items}
 
 TEMPLATE PDF EXCERPTS:
 {template_pdf_excerpts}
@@ -1447,11 +1885,15 @@ Important evaluation rule:
 Judge semantic alignment, not exact section numbering.
 If the diagram/content is present under a different numbered section, do NOT penalize that numbering mismatch by itself.
 
+Diagram acceptance rule:
+Do not mark PRESENT unless the referenced diagrams appear aligned to the requested diagram type. If STRUCTURED REQUIREMENT ITEMS are listed, use them to judge whether the expected diagram content is actually evidenced.
+
 TAG: {tag}
 INTENT: {intent}
 SEMANTIC TAG: {semantic_tag}
 NOTES: {notes}
 REQUIRED: {required_flag}
+STRUCTURED REQUIREMENT ITEMS: {structured_items}
 
 TEMPLATE_PDF_EXCERPTS:
 {template_pdf_excerpts}
@@ -1500,7 +1942,7 @@ Return STRICT JSON:
   "conceptual_present": true | false,
   "logical_present": true | false,
   "physical_present": true | false,
-  "diagram_refs": ["short caption or uri"]
+    "diagram_refs": ["short caption or uri"],
   "label_alignment_issues": ["example or empty"],
   "recommendations": ["short, actionable rec #1", "short, actionable rec #2"]
 }}
@@ -1533,26 +1975,26 @@ def run_validation(
             f"Unknown embedding model '{EMBED_MODEL}'. "
             f"Ensure VECTOR(dim) matches model output."
         )
-    
+
     template_nodes = _load_template_nodes(template_json_path)
     requirement_nodes = _iter_requirement_nodes(template_nodes)
     if not requirement_nodes:
         raise ValueError(f"No requirement nodes found in template JSON: {template_json_path}")
     logging.info(
-    "Loaded %s requirement node(s): must-have=%s, good-to-have=%s.",
-    len(requirement_nodes),
-    sum(
-        1
-        for node in requirement_nodes
-        if get_bool_flag(node, "musthave", "mustHave")
-    ),
-    sum(
-        1
-        for node in requirement_nodes
-        if get_bool_flag(node, "goodToHave", "goodtohave", "good to have")
-    ),
-)
-    
+        "Loaded %s requirement node(s): must-have=%s, good-to-have=%s.",
+        len(requirement_nodes),
+        sum(
+            1
+            for _, node in requirement_nodes
+            if _get_bool_flag(node, "musthave", "mustHave")
+        ),
+        sum(
+            1
+            for _, node in requirement_nodes
+            if _get_bool_flag(node, "goodToHave", "goodtohave", "good_to_have")
+        ),
+    )
+
     # Extract Template PDF text
     if template_pdf_path.lower().endswith(".pdf"):
         pdf_text = read_pdf_text(template_pdf_path)
@@ -1561,387 +2003,475 @@ def run_validation(
     else:
         logging.warning("Template PDF path is not PDF/DOCX; skipping PDF guidance extraction.")
         pdf_text = ""
-    
+
     results: List[Dict[str, Any]] = []
-    
+
     # Iterate over template
     for intent_name, child in requirement_nodes:
-            tag = (child.get("tag") or "").strip()
-            semantic_tag = semantic_tag_text(tag)
-            mreq = _get_bool_flag(child, "musthave", "mustHave")
-greq = _get_bool_flag(child, "goodToHave", "goodtohave", "good_to_have")
+        tag = (child.get("tag") or "").strip()
+        source = (child.get("source") or "").strip().lower()
+        semantic_tag = semantic_tag_text(tag)
+        mreq = _get_bool_flag(child, "musthave", "mustHave")
+        greq = _get_bool_flag(child, "goodToHave", "goodtohave", "good_to_have")
 
-notes = (child.get("notes", "") or "").strip()
-conds = (child.get("conditions", "") or "").strip()
+        notes = (child.get("notes", "") or "").strip()
+        conds = (child.get("conditions", "") or "").strip()
 
-kws = child.get("keywords") or []
-requirement_phrases = extract_requirement_phrases(notes, conds)
+        kws = child.get("keywords") or []
+        structured_items = extract_structured_requirement_items(notes, conds)
+        requirement_phrases = extract_requirement_phrases(notes, conds)
+        combined_match_terms: List[str] = []
+        seen_match_terms = set()
+        for candidate in [
+            *[k for k in kws if isinstance(k, str)],
+            *requirement_phrases,
+            *structured_items,
+        ]:
+            normalized_candidate = _normalize_match_text(candidate)
+            if normalized_candidate and normalized_candidate not in seen_match_terms:
+                seen_match_terms.add(normalized_candidate)
+                combined_match_terms.append(candidate)
 
-combined_match_terms = [
-    k for k in kws if isinstance(k, str)
-] + requirement_phrases
+        enforce_structured_items = is_table_like_requirement(
+            tag,
+            notes,
+            conds,
+            source,
+            structured_items,
+        ) and len(structured_items) >= 2
+        structured_items_block = ", ".join(structured_items) if structured_items else "(none)"
 
-kw_text = " ".join(
-    k.strip()
-    for k in combined_match_terms
-    if isinstance(k, str) and k.strip()
-)
+        kw_text = " ".join(
+            k.strip()
+            for k in combined_match_terms
+            if isinstance(k, str) and k.strip()
+        )
 
-# Topic-first retrieval queries
-topic_queries = build_topic_queries(
-    intent_name,
-    semantic_tag,
-    tag,
-    notes,
-    conds,
-    kw_text,
-    requirement_text="\n".join(requirement_phrases),
-)
+        topic_queries = build_topic_queries(
+            intent_name,
+            semantic_tag,
+            tag,
+            notes,
+            conds,
+            kw_text,
+            requirement_text="\n".join(requirement_phrases),
+        )
+        topic_search_phrases = build_topic_search_phrases(
+            semantic_tag,
+            tag,
+            kws,
+            requirement_phrases=requirement_phrases,
+        )
+        query_full = topic_queries[0] if topic_queries else " ".join(
+            s for s in [semantic_tag, kw_text] if s
+        ).strip()
 
-topic_search_phrases = build_topic_search_phrases(
-    semantic_tag,
-    tag,
-    kws,
-    requirement_phrases=requirement_phrases,
-)
-query_full = topic_queries[0] if topic_queries else " ".join(s for s in [semantic_tag, kw_text] if s).strip()
-            
- # Evidence text retrieval
-            ev_snips = retrieve_topic_evidence_snippets(
-                topic_queries,
+        ev_snips = retrieve_topic_evidence_snippets(
+            topic_queries,
+            nar_id,
+            release_number,
+            rtype,
+            effective_doc_id,
+            top_k,
+            topic_search_phrases,
+        )
+        s_join = build_compact_prompt_block(
+            ev_snips[:top_k],
+            empty_value="(no snippets found)",
+            max_snippets=4,
+            max_chars_per_snippet=700,
+            max_total_chars=2600,
+        )
+
+        g_snips = retrieve_guidance_snippets(query_full, rtype, top_n=3)
+        g_join = build_compact_prompt_block(
+            g_snips,
+            empty_value="(no guidance context)",
+            max_snippets=2,
+            max_chars_per_snippet=500,
+            max_total_chars=1000,
+        )
+
+        pdf_excerpts = pick_best_template_snippets_for_tag(
+            query_full,
+            pdf_text,
+            top_n=3,
+        )
+        pdf_join = build_compact_prompt_block(
+            pdf_excerpts,
+            empty_value="(no template-pdf excerpt)",
+            max_snippets=2,
+            max_chars_per_snippet=500,
+            max_total_chars=1000,
+        )
+
+        is_diagram = (
+            ("diagram" in tag.lower())
+            or ("diagram" in notes.lower())
+            or ("diagram" in conds.lower())
+            or any(isinstance(k, str) and "diagram" in k.lower() for k in kws)
+        )
+
+        mm_hits: List[Dict[str, str]] = []
+        if enable_mm and is_diagram:
+            raw_mm_hits = retrieve_mm_diagrams_safe(
+                query_full,
                 nar_id,
                 release_number,
                 rtype,
                 effective_doc_id,
-                top_k,
-                topic_search_phrases,
+                top_n=3,
+                dim=MM_DIM,
             )
-            s_join = build_compact_prompt_block(
-    ev_snips[:top_k],
-    empty_value="(no snippets found)",
-    max_snippets=4,
-    max_chars_per_snippet=700,
-    max_total_chars=2600,
-)
-
-# Guidance retrieval (optional)
-g_snips = retrieve_guidance_snippets(query_full, type, top_n=3)
-g_join = build_compact_prompt_block(
-    g_snips,
-    empty_value="(no guidance context)",
-    max_snippets=2,
-    max_chars_per_snippet=500,
-    max_total_chars=1000,
-)
-
-# Template PDF excerpts relevant to this tag
-pdf_excerpts = pick_best_template_snippets_for_tag(
-    query_full,
-    pdf_text,
-    top_n=3,
-)
-pdf_join = build_compact_prompt_block(
-    pdf_excerpts,
-    empty_value="(no template-pdf excerpt)",
-    max_snippets=2,
-    max_chars_per_snippet=500,
-    max_total_chars=1000,
-)
-            
-            # Diagram detection
-            is_diagram = (
-                ("diagram" in tag.lower())
-                or ("diagram" in notes.lower())
-                or ("diagram" in conds.lower())
-                or any(isinstance(k, str) and "diagram" in k.lower() for k in kws)
+            mm_hits = filter_relevant_diagram_refs(
+                semantic_tag,
+                combined_match_terms,
+                raw_mm_hits,
             )
-            
-            if enable_mm and is_diagram:
-                mm_hits = retrieve_mm_diagrams(
-                    query_full,
-                    nar_id,
-                    release_number,
-                    rtype,
-                    effective_doc_id,
-                    top_n=3,
-                    dim=MM_DIM,
+            if len(mm_hits) != len(raw_mm_hits):
+                logging.info(
+                    "Filtered %s non-aligned diagram ref(s) for tag '%s'.",
+                    len(raw_mm_hits) - len(mm_hits),
+                    tag,
                 )
-                diag_lines = [
-    _truncate_text(f"{h['caption']}: {h['doc_uri']}", 260)
-    for h in mm_hits
-]
+            diag_lines = [
+                _truncate_text(f"{hit['caption']}: {hit['doc_uri']}", 260)
+                for hit in mm_hits
+            ]
+            diag_block = "\n".join(line for line in diag_lines if line) or "(none)"
 
-diag_block = "\n".join(line for line in diag_lines if line) or "(none)"
-
-diagram_prompt = DIAGRAM_PROMPT.format(
-    tag=tag,
-    intent=intent_name,
-    semantic_tag=semantic_tag,
-    notes=_truncate_text(notes, 500),
-    required_flag=(
-        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-    ),
-    template_pdf_excerpts=pdf_join,
-    guidance=g_join,
-    evidence=s_join,
-    diagrams=diag_block,
-)
-
-diagram_compact_retry_prompt = DIAGRAM_PROMPT.format(
-    tag=tag,
-    intent=intent_name,
-    semantic_tag=semantic_tag,
-    notes=_truncate_text(notes, 240),
-    required_flag=(
-        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-    ),
-    template_pdf_excerpts=build_compact_prompt_block(
-        pdf_excerpts,
-        empty_value="(no template-pdf excerpt)",
-        max_snippets=1,
-        max_chars_per_snippet=280,
-        max_total_chars=280,
-    ),
-    guidance=build_compact_prompt_block(
-        g_snips,
-        empty_value="(no guidance context)",
-        max_snippets=1,
-        max_chars_per_snippet=220,
-        max_total_chars=220,
-    ),
-    evidence=build_compact_prompt_block(
-        ev_snips[:top_k],
-        empty_value="(no snippets found)",
-        max_snippets=2,
-        max_chars_per_snippet=380,
-        max_total_chars=760,
-    ),
-    diagrams="\n".join(diag_lines[:2]) or "(none)",
-)
-
-logging.info(
-    "Diagram prompt prepared for tag '%s' with length=%s; compact retry length=%s.",
-    tag,
-    len(diagram_prompt),
-    len(diagram_compact_retry_prompt),
-)
-
-p_json, validation_error = generate_structured_json_with_compact_retry(
-    diagram_prompt,
-    diagram_compact_retry_prompt,
-    response_kind=f"diagram validation for tag '{tag}'",
-)
-
-if validation_error:
-    logging.warning(
-        "Using deterministic diagram fallback for tag '%s' after model failure.",
-        tag,
-    )
-    p_json = _build_topic_validation_fallback(
-        tag=tag,
-        semantic_tag=semantic_tag,
-        keywords=combined_match_terms,
-        evidence_snippets=ev_snips,
-        guidance_snippets=g_snips,
-        template_pdf_snippets=pdf_excerpts,
-        validation_error=validation_error,
-        is_diagram=True,
-        diagram_refs=mm_hits,
-    )
-else:
-    mm_hits = []
-
-presence_prompt = PRESENCE_QUALITY_PROMPT.format(
-    tag=tag,
-    intent=intent_name,
-    semantic_tag=semantic_tag,
-    notes=_truncate_text(notes, 500),
-    required_flag=(
-        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-    ),
-    template_pdf_excerpts=pdf_join,
-    guidance=g_join,
-    evidence=s_join,
-)
-
-presence_compact_retry_prompt = PRESENCE_QUALITY_PROMPT.format(
-    tag=tag,
-    intent=intent_name,
-    semantic_tag=semantic_tag,
-    notes=_truncate_text(notes, 240),
-    required_flag=(
-        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-    ),
-    template_pdf_excerpts=build_compact_prompt_block(
-        pdf_excerpts,
-        empty_value="(no template-pdf excerpt)",
-        max_snippets=1,
-        max_chars_per_snippet=280,
-        max_total_chars=280,
-    ),
-    guidance=build_compact_prompt_block(
-        g_snips,
-        empty_value="(no guidance context)",
-        max_snippets=1,
-        max_chars_per_snippet=220,
-        max_total_chars=220,
-    ),
-    evidence=build_compact_prompt_block(
-        ev_snips[:top_k],
-        empty_value="(no snippets found)",
-        max_snippets=2,
-        max_chars_per_snippet=380,
-        max_total_chars=760,
-    ),
-)
-
-logging.info(
-    "Presence prompt prepared for tag '%s' with length=%s; compact retry length=%s.",
-    tag,
-    len(presence_prompt),
-    len(presence_compact_retry_prompt),
-)
-
-p_json, validation_error = generate_structured_json_with_compact_retry(
-    presence_prompt,
-    presence_compact_retry_prompt,
-    response_kind=f"presence validation for tag '{tag}'",
-)
-
-if validation_error:
-    logging.warning(
-        "Using deterministic presence fallback for tag '%s' after model failure.",
-        tag,
-    )
-    p_json = _build_topic_validation_fallback(
-        tag=tag,
-        semantic_tag=semantic_tag,
-        keywords=combined_match_terms,
-        evidence_snippets=ev_snips,
-        guidance_snippets=g_snips,
-        template_pdf_snippets=pdf_excerpts,
-        validation_error=validation_error,
-    )
-
-status = (
-    (p_json.get("status") if isinstance(p_json, dict) else None) or "MISSING"
-).upper()
-justification = p_json.get("justification", "") if isinstance(p_json, dict) else ""
-result_quality = p_json.get("quality", {}) if isinstance(p_json, dict) else {}
-result_citations = p_json.get("citations", {}) if isinstance(p_json, dict) else {}
-result_validation_error = validation_error
-
-if validation_error and status != "ERROR":
-    result_validation_error = None
-            
-            tag_1 = (tag or "").strip().lower()
-            topic_match = semantic_topic_match_strength(semantic_tag combined_match_terms, kws, ev_snips)
-            topic_alignment = topic_alignment_status(tag, semantic_tag, ev_snips)
-
-            promote_semantic_match =
-            should_promote_semantic_match (
-                topic_match=topic_match,
-                topic_alignment=topic_alignment,
-                keywords=combined_match_terms,
-                evidence_snippets=ev_snips,
+            diagram_prompt = DIAGRAM_PROMPT.format(
+                tag=tag,
+                intent=intent_name,
+                semantic_tag=semantic_tag,
+                notes=_truncate_text(notes, 500),
+                required_flag=(
+                    "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                ),
+                structured_items=_truncate_text(structured_items_block, 400),
+                template_pdf_excerpts=pdf_join,
+                guidance=g_join,
+                evidence=s_join,
+                diagrams=diag_block,
             )
-            
+            diagram_compact_retry_prompt = DIAGRAM_PROMPT.format(
+                tag=tag,
+                intent=intent_name,
+                semantic_tag=semantic_tag,
+                notes=_truncate_text(notes, 240),
+                required_flag=(
+                    "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                ),
+                structured_items=_truncate_text(structured_items_block, 240),
+                template_pdf_excerpts=build_compact_prompt_block(
+                    pdf_excerpts,
+                    empty_value="(no template-pdf excerpt)",
+                    max_snippets=1,
+                    max_chars_per_snippet=280,
+                    max_total_chars=280,
+                ),
+                guidance=build_compact_prompt_block(
+                    g_snips,
+                    empty_value="(no guidance context)",
+                    max_snippets=1,
+                    max_chars_per_snippet=220,
+                    max_total_chars=220,
+                ),
+                evidence=build_compact_prompt_block(
+                    ev_snips[:top_k],
+                    empty_value="(no snippets found)",
+                    max_snippets=2,
+                    max_chars_per_snippet=380,
+                    max_total_chars=760,
+                ),
+                diagrams="\n".join(diag_lines[:2]) or "(none)",
+            )
 
-            if promote_semantic_match and status in ("MISSING", "PARTIAL", "ERROR"):
-                status = "PRESENT"
-                if topic_alignment == "aligned":
-                    topic_note = (
-                        f"Topic '{semantic_tag}' was found in the evidence and is well-aligned with the expected template tag '{tag}'. "
-                        "Marked PRESENT based on strong semantic match and alignment, despite any numbering or labeling differences."
+            logging.info(
+                "Diagram prompt prepared for tag '%s' with length=%s; compact retry length=%s.",
+                tag,
+                len(diagram_prompt),
+                len(diagram_compact_retry_prompt),
+            )
+            p_json, validation_error = generate_structured_json_with_compact_retry(
+                diagram_prompt,
+                diagram_compact_retry_prompt,
+                response_kind=f"diagram validation for tag '{tag}'",
+            )
+
+            if validation_error:
+                logging.warning(
+                    "Using deterministic diagram fallback for tag '%s' after model failure.",
+                    tag,
+                )
+                p_json = _build_topic_validation_fallback(
+                    tag=tag,
+                    semantic_tag=semantic_tag,
+                    keywords=combined_match_terms,
+                    evidence_snippets=ev_snips,
+                    guidance_snippets=g_snips,
+                    template_pdf_snippets=pdf_excerpts,
+                    validation_error=validation_error,
+                    is_diagram=True,
+                    diagram_refs=mm_hits,
+                )
+        else:
+            presence_prompt = PRESENCE_QUALITY_PROMPT.format(
+                tag=tag,
+                intent=intent_name,
+                semantic_tag=semantic_tag,
+                notes=_truncate_text(notes, 500),
+                required_flag=(
+                    "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                ),
+                structured_items=_truncate_text(structured_items_block, 400),
+                template_pdf_excerpts=pdf_join,
+                guidance=g_join,
+                evidence=s_join,
+            )
+            presence_compact_retry_prompt = PRESENCE_QUALITY_PROMPT.format(
+                tag=tag,
+                intent=intent_name,
+                semantic_tag=semantic_tag,
+                notes=_truncate_text(notes, 240),
+                required_flag=(
+                    "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                ),
+                structured_items=_truncate_text(structured_items_block, 240),
+                template_pdf_excerpts=build_compact_prompt_block(
+                    pdf_excerpts,
+                    empty_value="(no template-pdf excerpt)",
+                    max_snippets=1,
+                    max_chars_per_snippet=280,
+                    max_total_chars=280,
+                ),
+                guidance=build_compact_prompt_block(
+                    g_snips,
+                    empty_value="(no guidance context)",
+                    max_snippets=1,
+                    max_chars_per_snippet=220,
+                    max_total_chars=220,
+                ),
+                evidence=build_compact_prompt_block(
+                    ev_snips[:top_k],
+                    empty_value="(no snippets found)",
+                    max_snippets=2,
+                    max_chars_per_snippet=380,
+                    max_total_chars=760,
+                ),
+            )
+
+            logging.info(
+                "Presence prompt prepared for tag '%s' with length=%s; compact retry length=%s.",
+                tag,
+                len(presence_prompt),
+                len(presence_compact_retry_prompt),
+            )
+            p_json, validation_error = generate_structured_json_with_compact_retry(
+                presence_prompt,
+                presence_compact_retry_prompt,
+                response_kind=f"presence validation for tag '{tag}'",
+            )
+
+            if validation_error:
+                logging.warning(
+                    "Using deterministic presence fallback for tag '%s' after model failure.",
+                    tag,
+                )
+                p_json = _build_topic_validation_fallback(
+                    tag=tag,
+                    semantic_tag=semantic_tag,
+                    keywords=combined_match_terms,
+                    evidence_snippets=ev_snips,
+                    guidance_snippets=g_snips,
+                    template_pdf_snippets=pdf_excerpts,
+                    validation_error=validation_error,
+                )
+
+        status = (
+            (p_json.get("status") if isinstance(p_json, dict) else None) or "MISSING"
+        ).upper()
+        justification = p_json.get("justification", "") if isinstance(p_json, dict) else ""
+        result_quality = p_json.get("quality", {}) if isinstance(p_json, dict) else {}
+        result_citations = p_json.get("citations", {}) if isinstance(p_json, dict) else {}
+        result_validation_error = validation_error
+
+        tag_1 = (tag or "").strip().lower()
+        topic_match = semantic_topic_match_strength(
+            semantic_tag,
+            combined_match_terms,
+            ev_snips,
+        )
+        diagram_ref_alignment = (
+            semantic_topic_match_strength(
+                semantic_tag,
+                combined_match_terms,
+                build_diagram_reference_texts(mm_hits),
+            )
+            if is_diagram and mm_hits
+            else None
+        )
+        structured_item_coverage = assess_requirement_item_coverage(
+            structured_items,
+            ev_snips + (build_diagram_reference_texts(mm_hits) if is_diagram else []),
+        )
+        structured_ready_for_present = (
+            not enforce_structured_items
+            or requirement_items_ready_for_present(structured_item_coverage)
+        )
+        diagram_ready_for_present = (
+            topic_match == "exact"
+            if is_diagram and not enable_mm
+            else (
+                not is_diagram
+                or (
+                    bool(mm_hits)
+                    and (
+                        diagram_ref_alignment in ("exact", "partial")
+                        or topic_match == "exact"
                     )
+                )
+            )
+        )
+        topic_alignment = topic_alignment_status(tag, semantic_tag, ev_snips)
+        promote_semantic_match = should_promote_semantic_match(
+            topic_match=topic_match,
+            topic_alignment=topic_alignment,
+            keywords=combined_match_terms,
+            evidence_snippets=ev_snips,
+        ) and structured_ready_for_present and diagram_ready_for_present
+
+        if promote_semantic_match and status in ("MISSING", "PARTIAL", "ERROR"):
+            status = "PRESENT"
+            if topic_alignment == "aligned":
+                topic_note = (
+                    f"Topic '{semantic_tag}' was found in the evidence and is well-aligned with the expected template tag '{tag}'. "
+                    "Marked PRESENT based on strong semantic match and alignment, despite any numbering or labeling differences."
+                )
             elif topic_alignment == "misaligned":
                 topic_note = (
                     f"Topic '{semantic_tag}' appears in the evidence, but not under the expected template tag '{tag}'. "
                     "Marked PRESENT because the content is present but the section/tag alignment does not match the template."
                 )
-                else:
-                    topic_note = (
-                        f"Topic '{semantic_tag}' was identified in the evidence with a partial semantic match. "
-                        "Marked PRESENT based on the presence of relevant content, even though it may not fully meet all criteria or be perfectly aligned."
-                    )
-                justification = topic_note
-                result_validation_error = None  
-                if not isinstance(result_citations, dict):
-                    result_citations = ()
-            
-            if tag_1 in ("0.1 nar id", "8.1 nar id", "nar id") and nar_id:
-                status = "PRESENT"
-                justification = f"NAR ID '{nar_id}' was resolved from evidence."
-                result_validation_error = None
-            
-            if tag_1 in ("0.2 app name", "0.2 application name", "app name", "application name") and application_name:
-                status = "PRESENT"
-                justification = f"Application name '{application_name}' was resolved from evidence."
-                result_validation_error = None
+            else:
+                topic_note = (
+                    f"Topic '{semantic_tag}' was identified in the evidence with a partial semantic match. "
+                    "Marked PRESENT based on the presence of relevant content, even though it may not fully meet all criteria or be perfectly aligned."
+                )
+            justification = topic_note
+            if not isinstance(result_citations, dict):
+                result_citations = {}
 
-            if tag_1 in ("0.3 r-type", "0.3 r type", "r-type", "r type", "rtype") and rtype:
-                status = "PRESENT"
-                justification = f"R-Type '{rtype}' was provided for validation."
-                result_validation_error = None
-            
-            results.append({
-                "intent": intent_name,
-                "tag": tag,
-                "musthave": mreq,
-                "good_to_have": greq,
-                "status": status,
-                "quality": result_quality,
-                "justification": justification,
-                "citations": result_ citations,
-                "diagram_refs": mm_hits,
-                "snippets": ev_snips [:top_k],
-                "used_guidance": bool(g_snips),
-                "template_pdf_used": bool (pdf_excerpts),
-                "fallback_used": bool (validation error),
-                "match_strength": topic_match,
-                "topic_alignment": topic_alignment,
-                "evidence_snippet _count": len (ev_snips) ,
-                "guidance_snippet_count": len (g_snips),
-                "template_pdf_snippet_count": len (pdf_excerpts) ,
-                "diagram_ ref_count": len (mm hits) ,
-                "validator error": result_validation error,
-            })
-    
+        if tag_1 in ("0.1 nar id", "8.1 nar id", "nar id") and nar_id:
+            status = "PRESENT"
+            justification = f"NAR ID '{nar_id}' was resolved from evidence."
+
+        if tag_1 in (
+            "0.2 app name",
+            "0.2 application name",
+            "app name",
+            "application name",
+        ) and application_name:
+            status = "PRESENT"
+            justification = f"Application name '{application_name}' was resolved from evidence."
+
+        if tag_1 in ("0.3 r-type", "0.3 r type", "r-type", "r type", "rtype") and rtype:
+            status = "PRESENT"
+            justification = f"R-Type '{rtype}' was provided for validation."
+
+        if enforce_structured_items and status == "PRESENT" and not structured_ready_for_present:
+            missing_items_text = ", ".join(structured_item_coverage["missing_items"][:4]) or "none"
+            matched_items_text = ", ".join(structured_item_coverage["matched_items"][:4]) or "none"
+            status = "PARTIAL" if (ev_snips or structured_item_coverage["matched_count"]) else "MISSING"
+            justification = (
+                f"Topic '{semantic_tag}' was not kept as PRESENT because the template lists explicit required items and "
+                f"the retrieved evidence only matched {structured_item_coverage['matched_count']}/"
+                f"{structured_item_coverage['total_count']}. Matched: {matched_items_text}. "
+                f"Missing: {missing_items_text}."
+            )
+
+        if is_diagram and status == "PRESENT" and not diagram_ready_for_present:
+            status = "PARTIAL" if (mm_hits or ev_snips) else "MISSING"
+            if enable_mm:
+                if mm_hits:
+                    justification = (
+                        f"Diagram topic '{semantic_tag}' has diagram references, but they are not clearly aligned to the required diagram type. "
+                        f"Diagram ref alignment={diagram_ref_alignment or 'none'}."
+                    )
+                else:
+                    justification = (
+                        f"Diagram topic '{semantic_tag}' was not kept as PRESENT because no aligned diagram references were retrieved."
+                    )
+            else:
+                justification = (
+                    f"Diagram topic '{semantic_tag}' was only checked via text evidence because multimodal validation is disabled, "
+                    "so PRESENT requires an exact textual diagram match."
+                )
+
+        results.append({
+            "intent": intent_name,
+            "tag": tag,
+            "musthave": mreq,
+            "good_to_have": greq,
+            "status": status,
+            "quality": result_quality,
+            "justification": justification,
+            "citations": result_citations,
+            "diagram_refs": mm_hits,
+            "snippets": ev_snips[:top_k],
+            "used_guidance": bool(g_snips),
+            "template_pdf_used": bool(pdf_excerpts),
+            "fallback_used": bool(validation_error),
+            "match_strength": topic_match,
+            "topic_alignment": topic_alignment,
+            "structured_requirement_items": structured_items,
+            "matched_requirement_items": structured_item_coverage["matched_items"],
+            "missing_requirement_items": structured_item_coverage["missing_items"],
+            "structured_requirement_gate_passed": structured_ready_for_present,
+            "diagram_expected": is_diagram,
+            "diagram_reference_alignment": diagram_ref_alignment,
+            "diagram_ready_for_present": diagram_ready_for_present,
+            "evidence_snippet_count": len(ev_snips),
+            "guidance_snippet_count": len(g_snips),
+            "template_pdf_snippet_count": len(pdf_excerpts),
+            "diagram_ref_count": len(mm_hits),
+            "validator_error": result_validation_error,
+        })
+
     # Architecture summary (conceptual, logical, physical)
     arch_query = "overall Architecture Conceptual Logical Physical GKE Cloud SQL Interfaces components"
     arch_snips = retrieve_evidence_snippets(
         arch_query, nar_id, release_number, rtype, effective_doc_id, top_n=18
     )
     arch_mm_hits = (
-    retrieve_mm_diagrams(
-        "overall architecture conceptual logical physical deployment topology interfaces diagram",
-        nar_id,
-        release_number,
-        rtype,
-        effective_doc_id,
-        top_n=4,
-        dim=MM_DIM,
+        retrieve_mm_diagrams_safe(
+            "overall architecture conceptual logical physical deployment topology interfaces diagram",
+            nar_id,
+            release_number,
+            rtype,
+            effective_doc_id,
+            top_n=4,
+            dim=MM_DIM,
+        )
+        if enable_mm
+        else []
     )
-    if enable_mm
-    else []
-)
 
-arch_pdf = pick_best_template_snippets_for_tag(
-    "Overall Architecture Diagrams Conceptual Logical Physical",
-    pdf_text,
-    top_n=3,
-)
+    arch_pdf = pick_best_template_snippets_for_tag(
+        "Overall Architecture Diagrams Conceptual Logical Physical",
+        pdf_text,
+        top_n=3,
+    )
+    arch_pdf_join = "\n".join(arch_pdf) if arch_pdf else "(no template-pdf excerpt)"
 
-arch_pdf_join = "\n".join(arch_pdf) if arch_pdf else "(no template-pdf excerpt)"
-
-arch_json, architecture_error = generate_architecture_summary_json(
-    template_pdf_excerpts=arch_pdf_join,
-    evidence_snippets=arch_snips,
-    diagram_refs=arch_mm_hits,
-)
+    arch_json, architecture_error = generate_architecture_summary_json(
+        template_pdf_excerpts=arch_pdf_join,
+        evidence_snippets=arch_snips,
+        diagram_refs=arch_mm_hits,
+    )
     if architecture_error:
         arch_json = _build_architecture_fallback(arch_snips, architecture_error, arch_mm_hits)
-    
+
     logging.info(f"arch_json result: {arch_json}")
 
     if not results:
@@ -1951,7 +2481,7 @@ arch_json, architecture_error = generate_architecture_summary_json(
     must_met = sum(1 for item in results if item.get("musthave") and item.get("status") == "PRESENT")
     good_total = sum(1 for item in results if item.get("good_to_have"))
     good_met = sum(1 for item in results if item.get("good_to_have") and item.get("status") == "PRESENT")
-    
+
     scope_label = _resolve_validation_scope_label(
         nar_id=nar_id,
         release_number=release_number,
@@ -1973,6 +2503,14 @@ arch_json, architecture_error = generate_architecture_summary_json(
         "good_to_have_coverage_pct": round((good_met / good_total * 100.0), 1) if good_total else 0.0,
         "fallback_topic_count": sum(1 for item in results if item.get("fallback_used")),
         "topics_with_validator_warnings": sum(1 for item in results if item.get("validator_error")),
+        "topics_with_structured_item_gaps": sum(
+            1 for item in results if item.get("missing_requirement_items")
+        ),
+        "diagram_topics_without_clear_alignment": sum(
+            1
+            for item in results
+            if item.get("diagram_expected") and not item.get("diagram_ready_for_present")
+        ),
         "architecture_evidence_snippet_count": len(arch_snips),
         "architecture_diagram_ref_count": len(arch_mm_hits),
         "architecture_template_excerpt_count": len(arch_pdf),
@@ -1980,7 +2518,7 @@ arch_json, architecture_error = generate_architecture_summary_json(
         "architecture": arch_json,
         "architecture_error": architecture_error,
     }
-    
+
     return {"summary": summary, "per_intent": results}
 
 
@@ -1998,22 +2536,26 @@ def generate_summary_pdf(
         from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
         from reportlab.lib import colors
         from reportlab.lib.pagesizes import A4
-        
+
         if not (pdf_output_path or "").strip():
             pdf_output_path = "summary_report.pdf"
-        
+
         if not pdf_output_path.lower().endswith(".pdf"):
             pdf_output_path = f"{pdf_output_path}.pdf"
-        
+
         styles = getSampleStyleSheet()
         link_style = styles["Normal"].clone("link_style")
         link_style.textColor = colors.blue
         link_style.underline = True
-        
+
+        def safe_pdf_text(value: Any) -> str:
+            text = xml_escape(str(value or ""), {'"': "&quot;", "'": "&#39;"})
+            return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+
         summary = result.get("summary", {})
         per_intent = result.get("per_intent", [])
         architecture = summary.get("architecture", {}) or {}
-        
+
         nar_id = summary.get("nar_id", "")
         application_name = summary.get("application_name", "")
         release_number = summary.get("release_number", "")
@@ -2022,21 +2564,21 @@ def generate_summary_pdf(
         must_have_met = summary.get("must_have_met", 0)
         must_have_coverage = summary.get("must_have_coverage_pct", 0.0)
         must_have_diff = must_have_total - must_have_met
-        
+
         good_to_have_total = summary.get("good_to_have_total", 0)
         good_to_have_met = summary.get("good_to_have_met", 0)
         good_to_have_diff = good_to_have_total - good_to_have_met
         good_to_have_coverage = summary.get("good_to_have_coverage_pct", 0.0)
-        
+
         architecture_summary = architecture.get("summary", "")
         if not architecture_summary:
             architecture_summary = (
                 f"This report is for NAR ID {nar_id}, application {application_name}, "
                 f"release {release_number}, and rtype {rtype}."
             )
-        
+
         result_status = "PASS" if must_have_total == must_have_met else "FAIL"
-        
+
         doc = SimpleDocTemplate(
             pdf_output_path,
             pagesize=A4,
@@ -2062,7 +2604,7 @@ def generate_summary_pdf(
             fontSize=10,
             textColor=colors.HexColor("#333333"),
         )
-        
+
         def section_heading(text):
             tbl = Table(
                 [[Paragraph(f"<b>{text}</b>", ParagraphStyle(
@@ -2083,29 +2625,29 @@ def generate_summary_pdf(
                 ("BOTTOMPADDING", (0, 0), (-1, -1), 4),
             ]))
             return tbl
-        
+
         story = []
         story.append(Paragraph("SDLC Control Validation Summary", title_style))
         story.append(Spacer(1, 8))
         story.append(section_heading("Document Information"))
         story.append(Spacer(1, 8))
-        
+
         metadata_table_data = [
             [
                 Paragraph("<b>NAR ID</b>", normal_style),
-                Paragraph(str(nar_id), normal_style),
+                Paragraph(safe_pdf_text(nar_id), normal_style),
             ],
             [
                 Paragraph("<b>Application</b>", normal_style),
-                Paragraph(str(application_name), normal_style),
+                Paragraph(safe_pdf_text(application_name), normal_style),
             ],
             [
                 Paragraph("<b>Release</b>", normal_style),
-                Paragraph(str(release_number), normal_style),
+                Paragraph(safe_pdf_text(release_number), normal_style),
             ],
             [
                 Paragraph("<b>Type</b>", normal_style),
-                Paragraph(str(rtype), normal_style),
+                Paragraph(safe_pdf_text(rtype), normal_style),
             ],
         ]
         metadata_table = Table(metadata_table_data, colWidths=[120, 380])
@@ -2122,10 +2664,10 @@ def generate_summary_pdf(
         ]))
         story.append(metadata_table)
         story.append(Spacer(1, 12))
-        
+
         story.append(section_heading("Result"))
         story.append(Spacer(1, 6))
-        
+
         reason_text = (
             "All must-have requirements are met."
             if result_status == "PASS"
@@ -2148,10 +2690,10 @@ def generate_summary_pdf(
         )
         story.append(Paragraph(f"Reason: {reason_text}", result_line_style))
         story.append(Spacer(1, 10))
-        
+
         story.append(section_heading("Must-Have Requirements"))
         story.append(Spacer(1, 8))
-        
+
         metrics_data = [
             [
                 Paragraph("<b>Total</b>", small_style),
@@ -2182,10 +2724,10 @@ def generate_summary_pdf(
         ]))
         story.append(metrics_table)
         story.append(Spacer(1, 12))
-        
+
         story.append(section_heading("Good-to-Have Requirements"))
         story.append(Spacer(1, 8))
-        
+
         good_metrics_data = [
             [
                 Paragraph("<b>Total</b>", small_style),
@@ -2216,13 +2758,13 @@ def generate_summary_pdf(
         ]))
         story.append(good_metrics_table)
         story.append(Spacer(1, 12))
-        
+
         story.append(section_heading("Justification"))
         story.append(Spacer(1, 8))
-        
+
         table_data = [[Paragraph("<b>Name</b>", normal_style), Paragraph("<b>Justification</b>", normal_style)]]
         found_rows = 0
-        
+
         for item in per_intent:
             if item.get("musthave") and item.get("status") != "PRESENT":
                 name = item.get("tag", "") or item.get("intent", "") or "N/A"
@@ -2230,11 +2772,11 @@ def generate_summary_pdf(
                 justification = item.get("justification", "") or "No justification available."
                 justification_text = f"[{status_val}] {justification}" if status_val else justification
                 table_data.append([
-                    Paragraph(str(name), normal_style),
-                    Paragraph(str(justification_text), normal_style),
+                    Paragraph(safe_pdf_text(name), normal_style),
+                    Paragraph(safe_pdf_text(justification_text), normal_style),
                 ])
                 found_rows += 1
-        
+
         if found_rows == 0:
             table_data.append([
                 Paragraph("No Gap", normal_style),
@@ -2243,7 +2785,7 @@ def generate_summary_pdf(
                     normal_style,
                 ),
             ])
-        
+
         justification_table = Table(table_data, colWidths=[160, 330])
         justification_table.setStyle(TableStyle([
             ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9eaf7")),
@@ -2258,12 +2800,12 @@ def generate_summary_pdf(
         ]))
         story.append(justification_table)
         story.append(Spacer(1, 16))
-        
+
         story.append(section_heading("Architecture Overview"))
         story.append(Spacer(1, 8))
-        story.append(Paragraph(architecture_summary, normal_style))
+        story.append(Paragraph(safe_pdf_text(architecture_summary), normal_style))
         story.append(Spacer(1, 12))
-        
+
         footer_text = f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
         footer_style = ParagraphStyle(
             "FooterStyle",
@@ -2272,12 +2814,12 @@ def generate_summary_pdf(
             textColor=colors.grey,
             alignment=2,
         )
-        story.append(Paragraph(footer_text, footer_style))
-        
+        story.append(Paragraph(safe_pdf_text(footer_text), footer_style))
+
         doc.build(story)
         logging.info(f"Enhanced PDF Summary Report generated: {pdf_output_path}")
         return True
-    
+
     except Exception as e:
         logging.error(f"Failed to generate PDF summary report: {e}")
         return False
@@ -2304,16 +2846,16 @@ def main():
     ap.add_argument("--enable-mm", action="store_true", help="Enable multimodal lane (diagram checks)")
     ap.add_argument("--out", default="validation_quality_result.json", help="Output JSON path")
     ap.add_argument("--pdf-out", default="summary_report.pdf", help="Output PDF path")
-    
+
     args = ap.parse_args()
-    
+
     rtype = resolve_rtype(args.rtype)
     logging.info(f"[CFG] Using rtype='{rtype}', TOP-K={args.top_k}, MM={args.enable_mm}")
-    
+
     # Fail fast on DB connection
     get_engine()
-    validate_runtime_contract(MM_DIM)
-    
+    validate_runtime_contract(MM_DIM if args.enable_mm else 0)
+
     scope_doc_id = args.scope_doc_id.strip() or args.scope_doc_hash.strip() or None
     if args.scope_doc_hash.strip() and not args.scope_doc_id.strip():
         logging.warning("--scope-doc-hash is deprecated; use --scope-doc-id instead.")
@@ -2324,7 +2866,7 @@ def main():
         logging.info(
             "No doc_id scope provided; validating across matching evidence for the selected NAR/release/rtype."
         )
-    
+
     result = run_validation(
         template_json_path=args.template_json,
         template_pdf_path=args.template_pdf,
@@ -2336,18 +2878,18 @@ def main():
         scope_doc_id=scope_doc_id,
         enable_mm=args.enable_mm,
     )
-    
+
     with open(args.out, "w", encoding="utf-8") as f:
         json.dump(result, f, indent=2, ensure_ascii=False)
     logging.info(f"Done. JSON: {args.out}")
-    
+
     pdf_output_path = args.pdf_out if args.pdf_out.lower().endswith(".pdf") else f"{args.pdf_out}.pdf"
     pdf_ok = generate_summary_pdf(result, pdf_output_path)
-    
+
     if pdf_ok:
         logging.info(f"Done. PDF: {pdf_output_path}")
     else:
-        logging.error("PDF generation failed")
+        raise RuntimeError(f"PDF generation failed: {pdf_output_path}")
 
 
 if __name__ == "__main__":
