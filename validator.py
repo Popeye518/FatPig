@@ -16,6 +16,7 @@ import atexit
 import re
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
+from xml.sax.saxutils import escape as xml_escape
 
 # Database & Connectors
 import sqlalchemy
@@ -206,6 +207,9 @@ def validate_runtime_contract(mm_dim: int) -> None:
             f"{TABLE_GUIDANCE}.embedding expects {guidance_embedding_type}, "
             f"but {EMBED_MODEL} is configured for dimension {EMBED_DIM}."
         )
+
+    if not mm_dim:
+        return
 
     mm_embedding_type = _get_column_format_type(TABLE_MM_EVID, "embedding")
     mm_embedding_dim = _parse_vector_dimension(mm_embedding_type)
@@ -720,6 +724,36 @@ def compact_snippets(
             break
 
     return compacted
+
+
+_TEMPLATE_PDF_INDEX_CACHE: Dict[str, Tuple[List[str], np.ndarray]] = {}
+
+
+def _get_template_pdf_index(pdf_text: str) -> Tuple[List[str], np.ndarray]:
+    """Build and cache a reusable embedding index for the template PDF."""
+    if not pdf_text.strip():
+        return [], np.empty((0, 0), dtype=np.float32)
+
+    cache_key = hashlib.sha256(pdf_text.encode("utf-8")).hexdigest()
+    cached = _TEMPLATE_PDF_INDEX_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+
+    chunks = split_text_local(pdf_text)
+    if not chunks:
+        cached = ([], np.empty((0, 0), dtype=np.float32))
+    else:
+        logging.info("Building template PDF embedding index for %s chunk(s).", len(chunks))
+        cached = (
+            chunks,
+            np.array(
+                embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT", out_dim=EMBED_DIM),
+                dtype=np.float32,
+            ),
+        )
+
+    _TEMPLATE_PDF_INDEX_CACHE[cache_key] = cached
+    return cached
 
 
 def _get_bool_flag(node: Dict[str, Any], *keys: str) -> bool:
@@ -1311,15 +1345,11 @@ def pick_best_template_snippets_for_tag(
     top_n: int = 3,
 ) -> List[str]:
     """Pick best matching snippets from template PDF using embeddings."""
-    if not pdf_text.strip():
+    chunks, emb_chunks = _get_template_pdf_index(pdf_text)
+    if not chunks or emb_chunks.size == 0:
         return []
-    chunks = split_text_local(pdf_text)
-    if not chunks:
-        return []
-    emb_chunks = embed_texts(chunks, task_type="RETRIEVAL_DOCUMENT", out_dim=EMBED_DIM)
     qv = np.array(embed_query_text(tag_query, out_dim=EMBED_DIM), dtype=np.float32).reshape(1, -1)
-    em = np.array(emb_chunks, dtype=np.float32)
-    sims = cosine_similarity(qv, em)[0]
+    sims = cosine_similarity(qv, emb_chunks)[0]
     idx = np.argsort(-sims)[:top_n]
     return [chunks[i] for i in idx]
 
@@ -1427,6 +1457,38 @@ def retrieve_mm_diagrams(
     with engine.connect() as c:
         rows = c.execute(sql, params).fetchall()
     return [{"caption": r[0], "doc_uri": r[1]} for r in rows]
+
+
+def retrieve_mm_diagrams_safe(
+    query_text: str,
+    nar_id: str,
+    release_number: str,
+    rtype: str,
+    doc_id: Optional[str],
+    top_n: int = 3,
+    dim: int = MM_DIM,
+) -> List[Dict[str, str]]:
+    """Best-effort multimodal retrieval that degrades to text-only validation."""
+    try:
+        return retrieve_mm_diagrams(
+            query_text=query_text,
+            nar_id=nar_id,
+            release_number=release_number,
+            rtype=rtype,
+            doc_id=doc_id,
+            top_n=top_n,
+            dim=dim,
+        )
+    except Exception as exc:
+        logging.warning(
+            "Multimodal retrieval failed for nar_id=%s, release=%s, rtype=%s, query=%r: %s",
+            nar_id,
+            release_number,
+            rtype,
+            _truncate_text(query_text, 120),
+            exc,
+        )
+        return []
 
 
 # ============================================================================
@@ -1693,7 +1755,7 @@ def run_validation(
 
         mm_hits: List[Dict[str, str]] = []
         if enable_mm and is_diagram:
-            mm_hits = retrieve_mm_diagrams(
+            mm_hits = retrieve_mm_diagrams_safe(
                 query_full,
                 nar_id,
                 release_number,
@@ -1860,9 +1922,6 @@ def run_validation(
         result_citations = p_json.get("citations", {}) if isinstance(p_json, dict) else {}
         result_validation_error = validation_error
 
-        if validation_error and status != "ERROR":
-            result_validation_error = None
-
         tag_1 = (tag or "").strip().lower()
         topic_match = semantic_topic_match_strength(
             semantic_tag,
@@ -1895,14 +1954,12 @@ def run_validation(
                     "Marked PRESENT based on the presence of relevant content, even though it may not fully meet all criteria or be perfectly aligned."
                 )
             justification = topic_note
-            result_validation_error = None
             if not isinstance(result_citations, dict):
                 result_citations = {}
 
         if tag_1 in ("0.1 nar id", "8.1 nar id", "nar id") and nar_id:
             status = "PRESENT"
             justification = f"NAR ID '{nar_id}' was resolved from evidence."
-            result_validation_error = None
 
         if tag_1 in (
             "0.2 app name",
@@ -1912,12 +1969,10 @@ def run_validation(
         ) and application_name:
             status = "PRESENT"
             justification = f"Application name '{application_name}' was resolved from evidence."
-            result_validation_error = None
 
         if tag_1 in ("0.3 r-type", "0.3 r type", "r-type", "r type", "rtype") and rtype:
             status = "PRESENT"
             justification = f"R-Type '{rtype}' was provided for validation."
-            result_validation_error = None
 
         results.append({
             "intent": intent_name,
@@ -1948,7 +2003,7 @@ def run_validation(
         arch_query, nar_id, release_number, rtype, effective_doc_id, top_n=18
     )
     arch_mm_hits = (
-        retrieve_mm_diagrams(
+        retrieve_mm_diagrams_safe(
             "overall architecture conceptual logical physical deployment topology interfaces diagram",
             nar_id,
             release_number,
@@ -2044,6 +2099,10 @@ def generate_summary_pdf(
         link_style.textColor = colors.blue
         link_style.underline = True
 
+        def safe_pdf_text(value: Any) -> str:
+            text = xml_escape(str(value or ""), {'"': "&quot;", "'": "&#39;"})
+            return text.replace("\r\n", "\n").replace("\r", "\n").replace("\n", "<br/>")
+
         summary = result.get("summary", {})
         per_intent = result.get("per_intent", [])
         architecture = summary.get("architecture", {}) or {}
@@ -2127,19 +2186,19 @@ def generate_summary_pdf(
         metadata_table_data = [
             [
                 Paragraph("<b>NAR ID</b>", normal_style),
-                Paragraph(str(nar_id), normal_style),
+                Paragraph(safe_pdf_text(nar_id), normal_style),
             ],
             [
                 Paragraph("<b>Application</b>", normal_style),
-                Paragraph(str(application_name), normal_style),
+                Paragraph(safe_pdf_text(application_name), normal_style),
             ],
             [
                 Paragraph("<b>Release</b>", normal_style),
-                Paragraph(str(release_number), normal_style),
+                Paragraph(safe_pdf_text(release_number), normal_style),
             ],
             [
                 Paragraph("<b>Type</b>", normal_style),
-                Paragraph(str(rtype), normal_style),
+                Paragraph(safe_pdf_text(rtype), normal_style),
             ],
         ]
         metadata_table = Table(metadata_table_data, colWidths=[120, 380])
@@ -2264,8 +2323,8 @@ def generate_summary_pdf(
                 justification = item.get("justification", "") or "No justification available."
                 justification_text = f"[{status_val}] {justification}" if status_val else justification
                 table_data.append([
-                    Paragraph(str(name), normal_style),
-                    Paragraph(str(justification_text), normal_style),
+                    Paragraph(safe_pdf_text(name), normal_style),
+                    Paragraph(safe_pdf_text(justification_text), normal_style),
                 ])
                 found_rows += 1
 
@@ -2295,7 +2354,7 @@ def generate_summary_pdf(
 
         story.append(section_heading("Architecture Overview"))
         story.append(Spacer(1, 8))
-        story.append(Paragraph(architecture_summary, normal_style))
+        story.append(Paragraph(safe_pdf_text(architecture_summary), normal_style))
         story.append(Spacer(1, 12))
 
         footer_text = f"Report Generated: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -2306,7 +2365,7 @@ def generate_summary_pdf(
             textColor=colors.grey,
             alignment=2,
         )
-        story.append(Paragraph(footer_text, footer_style))
+        story.append(Paragraph(safe_pdf_text(footer_text), footer_style))
 
         doc.build(story)
         logging.info(f"Enhanced PDF Summary Report generated: {pdf_output_path}")
@@ -2346,7 +2405,7 @@ def main():
 
     # Fail fast on DB connection
     get_engine()
-    validate_runtime_contract(MM_DIM)
+    validate_runtime_contract(MM_DIM if args.enable_mm else 0)
 
     scope_doc_id = args.scope_doc_id.strip() or args.scope_doc_hash.strip() or None
     if args.scope_doc_hash.strip() and not args.scope_doc_id.strip():
@@ -2381,7 +2440,7 @@ def main():
     if pdf_ok:
         logging.info(f"Done. PDF: {pdf_output_path}")
     else:
-        logging.error("PDF generation failed")
+        raise RuntimeError(f"PDF generation failed: {pdf_output_path}")
 
 
 if __name__ == "__main__":
