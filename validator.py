@@ -369,32 +369,167 @@ def mm_embed_image_with_caption(
     return vec
 
 
+def _safe_getattr(value: Any, attr_name: str, default: Any = None) -> Any:
+    """Read SDK attributes without letting property access abort extraction."""
+    try:
+        return getattr(value, attr_name)
+    except Exception:
+        return default
+
+
+def _to_plain_response_data(value: Any) -> Any:
+    """Best-effort conversion of SDK objects into plain dict/list data."""
+    if value is None or isinstance(value, (str, int, float, bool, dict, list, tuple)):
+        return value
+
+    for method_name, kwargs in (
+        ("model_dump", {"exclude_none": True}),
+        ("to_json_dict", {}),
+        ("dict", {}),
+    ):
+        method = _safe_getattr(value, method_name)
+        if not callable(method):
+            continue
+        try:
+            return method(**kwargs)
+        except TypeError:
+            try:
+                return method()
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+    try:
+        data = {k: v for k, v in vars(value).items() if not k.startswith("_")}
+    except Exception:
+        data = None
+    return data if data else value
+
+
+def _looks_like_json_payload(text_value: str) -> bool:
+    """Identify candidate strings that look like model JSON output."""
+    stripped = (text_value or "").strip()
+    return (
+        stripped.startswith("{")
+        or stripped.startswith("[")
+        or stripped.startswith("```json")
+        or stripped.startswith("```")
+    )
+
+
+def _collect_response_text_candidates(value: Any, depth: int = 0) -> List[str]:
+    """Recursively collect text payloads from SDK response objects."""
+    if depth > 5 or value is None:
+        return []
+
+    value = _to_plain_response_data(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        return [stripped] if stripped else []
+
+    if isinstance(value, (list, tuple)):
+        texts: List[str] = []
+        for item in value:
+            texts.extend(_collect_response_text_candidates(item, depth + 1))
+        return texts
+
+    if isinstance(value, dict):
+        for key in ("output_text", "text"):
+            text_value = value.get(key)
+            if isinstance(text_value, str) and text_value.strip():
+                return [text_value.strip()]
+
+        parsed = value.get("parsed")
+        if parsed is not None:
+            parsed = _to_plain_response_data(parsed)
+            if isinstance(parsed, (dict, list)):
+                return [json.dumps(parsed, ensure_ascii=False)]
+            if isinstance(parsed, str) and parsed.strip():
+                return [parsed.strip()]
+
+        for key in ("parts", "content", "candidates"):
+            child_texts = _collect_response_text_candidates(value.get(key), depth + 1)
+            if child_texts:
+                return child_texts
+
+        texts: List[str] = []
+        for child in value.values():
+            texts.extend(_collect_response_text_candidates(child, depth + 1))
+        return texts
+
+    return []
+
+
+def _summarize_generation_response(resp: Any) -> str:
+    """Return compact response metadata for empty-output diagnostics."""
+    payload = _to_plain_response_data(resp)
+    summary_bits = [f"response_type={type(resp).__name__}"]
+    if not isinstance(payload, dict):
+        return ", ".join(summary_bits)
+
+    candidates = payload.get("candidates") or []
+    summary_bits.append(f"candidate_count={len(candidates)}")
+
+    finish_reasons: List[str] = []
+    for candidate in candidates:
+        candidate_payload = _to_plain_response_data(candidate)
+        if not isinstance(candidate_payload, dict):
+            continue
+        finish_reason = candidate_payload.get("finish_reason") or candidate_payload.get("finishReason")
+        if finish_reason:
+            finish_reasons.append(str(finish_reason))
+    if finish_reasons:
+        summary_bits.append(f"finish_reasons={','.join(sorted(set(finish_reasons)))}")
+
+    prompt_feedback = payload.get("prompt_feedback") or payload.get("promptFeedback")
+    prompt_feedback = _to_plain_response_data(prompt_feedback)
+    if isinstance(prompt_feedback, dict):
+        block_reason = prompt_feedback.get("block_reason") or prompt_feedback.get("blockReason")
+        if block_reason:
+            summary_bits.append(f"block_reason={block_reason}")
+
+    return ", ".join(summary_bits)
+
+
 def _extract_generated_text(resp: Any) -> str:
     """Extract generated text from different SDK response shapes."""
-    direct_text = getattr(resp, "output_text", None) or getattr(resp, "text", None)
+    direct_text = _safe_getattr(resp, "output_text") or _safe_getattr(resp, "text")
     if isinstance(direct_text, str) and direct_text.strip():
         return direct_text.strip()
 
-    parsed = getattr(resp, "parsed", None)
+    parsed = _safe_getattr(resp, "parsed")
+    parsed = _to_plain_response_data(parsed)
     if isinstance(parsed, (dict, list)):
         return json.dumps(parsed, ensure_ascii=False)
     if isinstance(parsed, str) and parsed.strip():
         return parsed.strip()
 
     candidate_texts: List[str] = []
-    candidates = getattr(resp, "candidates", None)
+    candidates = _safe_getattr(resp, "candidates")
     if candidates:
         for candidate in candidates:
-            content = getattr(candidate, "content", None)
-            parts = getattr(content, "parts", None) if content is not None else None
+            content = _safe_getattr(candidate, "content")
+            parts = _safe_getattr(content, "parts") if content is not None else None
             if not parts:
+                candidate_texts.extend(
+                    text
+                    for text in _collect_response_text_candidates(candidate)
+                    if _looks_like_json_payload(text)
+                )
                 continue
             for part in parts:
-                part_text = getattr(part, "text", None)
+                part_text = _safe_getattr(part, "text")
                 if isinstance(part_text, str) and part_text.strip():
                     candidate_texts.append(part_text.strip())
+                    continue
+                candidate_texts.extend(
+                    text
+                    for text in _collect_response_text_candidates(part)
+                    if _looks_like_json_payload(text)
+                )
         if candidate_texts:
-            return "\n".join(candidate_texts)
+            return "\n".join(dict.fromkeys(candidate_texts))
 
     if isinstance(resp, dict):
         if isinstance(resp.get("text"), str) and resp["text"].strip():
@@ -409,6 +544,14 @@ def _extract_generated_text(resp: Any) -> str:
                     candidate_texts.append(part["text"].strip())
         if candidate_texts:
             return "\n".join(candidate_texts)
+
+    fallback_texts = [
+        text
+        for text in _collect_response_text_candidates(resp)
+        if _looks_like_json_payload(text)
+    ]
+    if fallback_texts:
+        return "\n".join(dict.fromkeys(fallback_texts))
 
     return ""
 
@@ -429,7 +572,10 @@ def gen_text(prompt: str) -> str:
         generated_text = _extract_generated_text(resp)
         if not generated_text:
             logging.warning(
-                f"LLM returned empty content for prompt length {len(prompt)} using model {LLM_MODEL}."
+                "LLM returned empty content for prompt length %s using model %s. %s",
+                len(prompt),
+                LLM_MODEL,
+                _summarize_generation_response(resp),
             )
         return generated_text
     except Exception as e:
@@ -508,7 +654,10 @@ def generate_structured_json(prompt: str, response_kind: str) -> Tuple[Dict[str,
     if error is None:
         return parsed, None
 
-    logging.warning(f"{response_kind} JSON parse failed on first attempt: {error}")
+    if error == "empty model response":
+        logging.warning("%s returned empty model response on first attempt.", response_kind)
+    else:
+        logging.warning("%s JSON parse failed on first attempt: %s", response_kind, error)
 
     repair_prompt = (
         f"{prompt}\n\n"
