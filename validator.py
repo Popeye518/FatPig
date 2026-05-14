@@ -556,26 +556,55 @@ def _extract_generated_text(resp: Any) -> str:
     return ""
 
 
+def _generate_with_config(prompt: str, generation_config: genai_types.GenerateContentConfig) -> Tuple[str, Any]:
+    """Run a single generation call and return extracted text plus raw response."""
+    resp = _genai.models.generate_content(
+        model=LLM_MODEL,
+        contents=[prompt],
+        config=generation_config,
+    )
+    return _extract_generated_text(resp), resp
+
+
 def gen_text(prompt: str) -> str:
     """Generate text using LLM."""
     try:
-        generation_config = genai_types.GenerateContentConfig(
+        json_generation_config = genai_types.GenerateContentConfig(
             temperature=0.0,
             max_output_tokens=2192,
             response_mime_type="application/json",
         )
-        resp = _genai.models.generate_content(
-            model=LLM_MODEL,
-            contents=prompt,
-            config=generation_config,
+        generated_text, resp = _generate_with_config(
+            prompt,
+            json_generation_config,
         )
-        generated_text = _extract_generated_text(resp)
         if not generated_text:
             logging.warning(
-                "LLM returned empty content for prompt length %s using model %s. %s",
+                "LLM returned empty JSON-mode content for prompt length %s using model %s. %s",
                 len(prompt),
                 LLM_MODEL,
                 _summarize_generation_response(resp),
+            )
+            text_generation_config = genai_types.GenerateContentConfig(
+                temperature=0.0,
+                max_output_tokens=2192,
+            )
+            generated_text, fallback_resp = _generate_with_config(
+                prompt,
+                text_generation_config,
+            )
+            if generated_text:
+                logging.info(
+                    "Recovered model output for prompt length %s using plain-text fallback mode.",
+                    len(prompt),
+                )
+                return generated_text
+
+            logging.warning(
+                "LLM returned empty plain-text fallback content for prompt length %s using model %s. %s",
+                len(prompt),
+                LLM_MODEL,
+                _summarize_generation_response(fallback_resp),
             )
         return generated_text
     except Exception as e:
