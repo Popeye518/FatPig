@@ -1587,6 +1587,11 @@ def requirement_items_ready_for_present(coverage: Dict[str, Any]) -> bool:
     return matched_count >= total_count - 1
 
 
+def requirement_items_partially_covered(coverage: Dict[str, Any]) -> bool:
+    """Detect whether at least some explicit structured items were evidenced."""
+    return int(coverage.get("matched_count") or 0) > 0
+
+
 def is_table_like_requirement(
     tag: str,
     notes: str,
@@ -2315,6 +2320,10 @@ def run_validation(
             structured_items,
             ev_snips + (build_diagram_reference_texts(mm_hits) if is_diagram else []),
         )
+        structured_partially_covered = requirement_items_partially_covered(
+            structured_item_coverage
+        )
+        topic_alignment = topic_alignment_status(tag, semantic_tag, ev_snips)
         structured_ready_for_present = (
             not enforce_structured_items
             or requirement_items_ready_for_present(structured_item_coverage)
@@ -2325,15 +2334,22 @@ def run_validation(
             else (
                 not is_diagram
                 or (
-                    bool(mm_hits)
-                    and (
-                        diagram_ref_alignment in ("exact", "partial")
-                        or topic_match == "exact"
+                    (
+                        bool(mm_hits)
+                        and (
+                            diagram_ref_alignment in ("exact", "partial")
+                            or topic_match == "exact"
+                            or topic_alignment in ("aligned", "misaligned")
+                        )
+                    )
+                    or (
+                        not mm_hits
+                        and topic_match == "exact"
+                        and topic_alignment in ("aligned", "misaligned")
                     )
                 )
             )
         )
-        topic_alignment = topic_alignment_status(tag, semantic_tag, ev_snips)
         promote_semantic_match = should_promote_semantic_match(
             topic_match=topic_match,
             topic_alignment=topic_alignment,
@@ -2390,6 +2406,15 @@ def run_validation(
                 f"Missing: {missing_items_text}."
             )
 
+        if enforce_structured_items and status in ("MISSING", "EMPTY", "ERROR") and structured_partially_covered:
+            missing_items_text = ", ".join(structured_item_coverage["missing_items"][:4]) or "none"
+            matched_items_text = ", ".join(structured_item_coverage["matched_items"][:4]) or "none"
+            status = "PARTIAL"
+            justification = (
+                f"Topic '{semantic_tag}' has partial structured evidence. Matched: {matched_items_text}. "
+                f"Still missing: {missing_items_text}."
+            )
+
         if is_diagram and status == "PRESENT" and not diagram_ready_for_present:
             status = "PARTIAL" if (mm_hits or ev_snips) else "MISSING"
             if enable_mm:
@@ -2406,6 +2431,18 @@ def run_validation(
                 justification = (
                     f"Diagram topic '{semantic_tag}' was only checked via text evidence because multimodal validation is disabled, "
                     "so PRESENT requires an exact textual diagram match."
+                )
+
+        if is_diagram and status in ("MISSING", "EMPTY", "ERROR") and (mm_hits or topic_alignment or topic_match in ("exact", "partial")):
+            status = "PARTIAL"
+            if mm_hits:
+                justification = (
+                    f"Diagram topic '{semantic_tag}' has some diagram or text evidence, but the validator could not confirm a fully aligned diagram reference. "
+                    f"Diagram ref alignment={diagram_ref_alignment or 'none'}, topic alignment={topic_alignment or 'none'}."
+                )
+            else:
+                justification = (
+                    f"Diagram topic '{semantic_tag}' has text evidence, but no clearly aligned multimodal diagram reference was confirmed."
                 )
 
         results.append({
