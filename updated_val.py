@@ -537,9 +537,17 @@ def generated_structured_json_with_compact_error(prompt: str, response_kind: str
     parsed, error = generate_structured_json(prompt, response_kind=response_kind)
     if error is None:
         return parsed, None
+    return parsed, error
+
+
+def generate_structured_json_with_compact_retry(prompt: str, compact_retry_prompt: str, response_kind: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Generate structured JSON with compact retry on failure."""
+    parsed, error = generate_structured_json(prompt, response_kind=response_kind)
+    if error is None:
+        return parsed, None
     
-    logging.warning("%s failed after standard retry; trying compact prompt length=%s.", response_kind, len(compact_retry_prompt),)
-    compact_parsed, compact_error = generate_structured_json(compact_retry_prompt, response_kind=f"{response_kind} (compact retry)",)
+    logging.warning("%s failed after standard retry; trying compact prompt length=%s.", response_kind, len(compact_retry_prompt))
+    compact_parsed, compact_error = generate_structured_json(compact_retry_prompt, response_kind=f"{response_kind} (compact retry)")
     return compact_parsed, compact_error
 
 def generate_architecture_summary_json(template_pdf_excerpts: str, evidence_snippets: List[str] , diagram_refs : Optional[List[Dict[str, str]]] = None) -> Tuple[Dict[str, Any], Optional[str]]:
@@ -1614,32 +1622,32 @@ combined_match_terms = [
     k for k in kws if isinstance(k, str)
 ] + requirement_phrases
 
-kw_text = " ".join(
-    k.strip()
-    for k in combined_match_terms
-    if isinstance(k, str) and k.strip()
-)
+            kw_text = " ".join(
+                k.strip()
+                for k in combined_match_terms
+                if isinstance(k, str) and k.strip()
+            )
 
-# Topic-first retrieval queries
-topic_queries = build_topic_queries(
-    intent_name,
-    semantic_tag,
-    tag,
-    notes,
-    conds,
-    kw_text,
-    requirement_text="\n".join(requirement_phrases),
-)
+            # Topic-first retrieval queries
+            topic_queries = build_topic_queries(
+                intent_name,
+                semantic_tag,
+                tag,
+                notes,
+                conds,
+                kw_text,
+                requirement_text="\n".join(requirement_phrases),
+            )
 
-topic_search_phrases = build_topic_search_phrases(
-    semantic_tag,
-    tag,
-    kws,
-    requirement_phrases=requirement_phrases,
-)
-query_full = topic_queries[0] if topic_queries else " ".join(s for s in [semantic_tag, kw_text] if s).strip()
+            topic_search_phrases = build_topic_search_phrases(
+                semantic_tag,
+                tag,
+                kws,
+                requirement_phrases=requirement_phrases,
+            )
+            query_full = topic_queries[0] if topic_queries else " ".join(s for s in [semantic_tag, kw_text] if s).strip()
             
- # Evidence text retrieval
+            # Evidence text retrieval
             ev_snips = retrieve_topic_evidence_snippets(
                 topic_queries,
                 nar_id,
@@ -1650,36 +1658,36 @@ query_full = topic_queries[0] if topic_queries else " ".join(s for s in [semanti
                 topic_search_phrases,
             )
             s_join = build_compact_prompt_block(
-    ev_snips[:top_k],
-    empty_value="(no snippets found)",
-    max_snippets=4,
-    max_chars_per_snippet=700,
-    max_total_chars=2600,
-)
+                ev_snips[:top_k],
+                empty_value="(no snippets found)",
+                max_snippets=4,
+                max_chars_per_snippet=700,
+                max_total_chars=2600,
+            )
 
-# Guidance retrieval (optional)
-g_snips = retrieve_guidance_snippets(query_full, type, top_n=3)
-g_join = build_compact_prompt_block(
-    g_snips,
-    empty_value="(no guidance context)",
-    max_snippets=2,
-    max_chars_per_snippet=500,
-    max_total_chars=1000,
-)
+            # Guidance retrieval (optional)
+            g_snips = retrieve_guidance_snippets(query_full, rtype, top_n=3)
+            g_join = build_compact_prompt_block(
+                g_snips,
+                empty_value="(no guidance context)",
+                max_snippets=2,
+                max_chars_per_snippet=500,
+                max_total_chars=1000,
+            )
 
-# Template PDF excerpts relevant to this tag
-pdf_excerpts = pick_best_template_snippets_for_tag(
-    query_full,
-    pdf_text,
-    top_n=3,
-)
-pdf_join = build_compact_prompt_block(
-    pdf_excerpts,
-    empty_value="(no template-pdf excerpt)",
-    max_snippets=2,
-    max_chars_per_snippet=500,
-    max_total_chars=1000,
-)
+            # Template PDF excerpts relevant to this tag
+            pdf_excerpts = pick_best_template_snippets_for_tag(
+                query_full,
+                pdf_text,
+                top_n=3,
+            )
+            pdf_join = build_compact_prompt_block(
+                pdf_excerpts,
+                empty_value="(no template-pdf excerpt)",
+                max_snippets=2,
+                max_chars_per_snippet=500,
+                max_total_chars=1000,
+            )
             
             # Diagram detection
             is_diagram = (
@@ -1700,185 +1708,183 @@ pdf_join = build_compact_prompt_block(
                     dim=MM_DIM,
                 )
                 diag_lines = [
-    _truncate_text(f"{h['caption']}: {h['doc_uri']}", 260)
-    for h in mm_hits
-]
+                    _truncate_text(f"{h['caption']}: {h['doc_uri']}", 260)
+                    for h in mm_hits
+                ]
 
-diag_block = "\n".join(line for line in diag_lines if line) or "(none)"
+                diag_block = "\n".join(line for line in diag_lines if line) or "(none)"
 
-diagram_prompt = DIAGRAM_PROMPT.format(
-    tag=tag,
-    intent=intent_name,
-    semantic_tag=semantic_tag,
-    notes=_truncate_text(notes, 500),
-    required_flag=(
-        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-    ),
-    template_pdf_excerpts=pdf_join,
-    guidance=g_join,
-    evidence=s_join,
-    diagrams=diag_block,
-)
+                diagram_prompt = DIAGRAM_PROMPT.format(
+                    tag=tag,
+                    intent=intent_name,
+                    semantic_tag=semantic_tag,
+                    notes=_truncate_text(notes, 500),
+                    required_flag=(
+                        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                    ),
+                    template_pdf_excerpts=pdf_join,
+                    guidance=g_join,
+                    evidence=s_join,
+                    diagrams=diag_block,
+                )
 
-diagram_compact_retry_prompt = DIAGRAM_PROMPT.format(
-    tag=tag,
-    intent=intent_name,
-    semantic_tag=semantic_tag,
-    notes=_truncate_text(notes, 240),
-    required_flag=(
-        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-    ),
-    template_pdf_excerpts=build_compact_prompt_block(
-        pdf_excerpts,
-        empty_value="(no template-pdf excerpt)",
-        max_snippets=1,
-        max_chars_per_snippet=280,
-        max_total_chars=280,
-    ),
-    guidance=build_compact_prompt_block(
-        g_snips,
-        empty_value="(no guidance context)",
-        max_snippets=1,
-        max_chars_per_snippet=220,
-        max_total_chars=220,
-    ),
-    evidence=build_compact_prompt_block(
-        ev_snips[:top_k],
-        empty_value="(no snippets found)",
-        max_snippets=2,
-        max_chars_per_snippet=380,
-        max_total_chars=760,
-    ),
-    diagrams="\n".join(diag_lines[:2]) or "(none)",
-)
+                                diagram_compact_retry_prompt = DIAGRAM_PROMPT.format(
+                    tag=tag,
+                    intent=intent_name,
+                    semantic_tag=semantic_tag,
+                    notes=_truncate_text(notes, 240),
+                    required_flag=(
+                        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                    ),
+                    template_pdf_excerpts=build_compact_prompt_block(
+                        pdf_excerpts,
+                        empty_value="(no template-pdf excerpt)",
+                        max_snippets=1,
+                        max_chars_per_snippet=280,
+                        max_total_chars=280,
+                    ),
+                    guidance=build_compact_prompt_block(
+                        g_snips,
+                        empty_value="(no guidance context)",
+                        max_snippets=1,
+                        max_chars_per_snippet=220,
+                        max_total_chars=220,
+                    ),
+                    evidence=build_compact_prompt_block(
+                        ev_snips[:top_k],
+                        empty_value="(no snippets found)",
+                        max_snippets=2,
+                        max_chars_per_snippet=380,
+                        max_total_chars=760,
+                    ),
+                    diagrams="\n".join(diag_lines[:2]) or "(none)",
+                )
 
-logging.info(
-    "Diagram prompt prepared for tag '%s' with length=%s; compact retry length=%s.",
-    tag,
-    len(diagram_prompt),
-    len(diagram_compact_retry_prompt),
-)
+                logging.info(
+                    "Diagram prompt prepared for tag '%s' with length=%s; compact retry length=%s.",
+                    tag,
+                    len(diagram_prompt),
+                    len(diagram_compact_retry_prompt),
+                )
 
-p_json, validation_error = generate_structured_json_with_compact_retry(
-    diagram_prompt,
-    diagram_compact_retry_prompt,
-    response_kind=f"diagram validation for tag '{tag}'",
-)
+                p_json, validation_error = generate_structured_json_with_compact_retry(
+                    diagram_prompt,
+                    diagram_compact_retry_prompt,
+                    response_kind=f"diagram validation for tag '{tag}'",
+                )
 
-if validation_error:
-    logging.warning(
-        "Using deterministic diagram fallback for tag '%s' after model failure.",
-        tag,
-    )
-    p_json = _build_topic_validation_fallback(
-        tag=tag,
-        semantic_tag=semantic_tag,
-        keywords=combined_match_terms,
-        evidence_snippets=ev_snips,
-        guidance_snippets=g_snips,
-        template_pdf_snippets=pdf_excerpts,
-        validation_error=validation_error,
-        is_diagram=True,
-        diagram_refs=mm_hits,
-    )
-else:
-    mm_hits = []
+                if validation_error:
+                    logging.warning(
+                        "Using deterministic diagram fallback for tag '%s' after model failure.",
+                        tag,
+                    )
+                    p_json = _build_topic_validation_fallback(
+                        tag=tag,
+                        semantic_tag=semantic_tag,
+                        keywords=combined_match_terms,
+                        evidence_snippets=ev_snips,
+                        guidance_snippets=g_snips,
+                        template_pdf_snippets=pdf_excerpts,
+                        validation_error=validation_error,
+                        is_diagram=True,
+                        diagram_refs=mm_hits,
+                    )
+                else:
+                    mm_hits = []
 
-presence_prompt = PRESENCE_QUALITY_PROMPT.format(
-    tag=tag,
-    intent=intent_name,
-    semantic_tag=semantic_tag,
-    notes=_truncate_text(notes, 500),
-    required_flag=(
-        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-    ),
-    template_pdf_excerpts=pdf_join,
-    guidance=g_join,
-    evidence=s_join,
-)
+            presence_prompt = PRESENCE_QUALITY_PROMPT.format(
+                tag=tag,
+                intent=intent_name,
+                semantic_tag=semantic_tag,
+                notes=_truncate_text(notes, 500),
+                required_flag=(
+                    "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                ),
+                template_pdf_excerpts=pdf_join,
+                guidance=g_join,
+                evidence=s_join,
+            )
 
-presence_compact_retry_prompt = PRESENCE_QUALITY_PROMPT.format(
-    tag=tag,
-    intent=intent_name,
-    semantic_tag=semantic_tag,
-    notes=_truncate_text(notes, 240),
-    required_flag=(
-        "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-    ),
-    template_pdf_excerpts=build_compact_prompt_block(
-        pdf_excerpts,
-        empty_value="(no template-pdf excerpt)",
-        max_snippets=1,
-        max_chars_per_snippet=280,
-        max_total_chars=280,
-    ),
-    guidance=build_compact_prompt_block(
-        g_snips,
-        empty_value="(no guidance context)",
-        max_snippets=1,
-        max_chars_per_snippet=220,
-        max_total_chars=220,
-    ),
-    evidence=build_compact_prompt_block(
-        ev_snips[:top_k],
-        empty_value="(no snippets found)",
-        max_snippets=2,
-        max_chars_per_snippet=380,
-        max_total_chars=760,
-    ),
-)
+            presence_compact_retry_prompt = PRESENCE_QUALITY_PROMPT.format(
+                tag=tag,
+                intent=intent_name,
+                semantic_tag=semantic_tag,
+                notes=_truncate_text(notes, 240),
+                required_flag=(
+                    "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                ),
+                template_pdf_excerpts=build_compact_prompt_block(
+                    pdf_excerpts,
+                    empty_value="(no template-pdf excerpt)",
+                    max_snippets=1,
+                    max_chars_per_snippet=280,
+                    max_total_chars=280,
+                ),
+                guidance=build_compact_prompt_block(
+                    g_snips,
+                    empty_value="(no guidance context)",
+                    max_snippets=1,
+                    max_chars_per_snippet=220,
+                    max_total_chars=220,
+                ),
+                evidence=build_compact_prompt_block(
+                    ev_snips[:top_k],
+                    empty_value="(no snippets found)",
+                    max_snippets=2,
+                    max_chars_per_snippet=380,
+                    max_total_chars=760,
+                ),
+            )
 
-logging.info(
-    "Presence prompt prepared for tag '%s' with length=%s; compact retry length=%s.",
-    tag,
-    len(presence_prompt),
-    len(presence_compact_retry_prompt),
-)
+            logging.info(
+                "Presence prompt prepared for tag '%s' with length=%s; compact retry length=%s.",
+                tag,
+                len(presence_prompt),
+                len(presence_compact_retry_prompt),
+            )
 
-p_json, validation_error = generate_structured_json_with_compact_retry(
-    presence_prompt,
-    presence_compact_retry_prompt,
-    response_kind=f"presence validation for tag '{tag}'",
-)
+            p_json, validation_error = generate_structured_json_with_compact_retry(
+                presence_prompt,
+                presence_compact_retry_prompt,
+                response_kind=f"presence validation for tag '{tag}'",
+            )
 
-if validation_error:
-    logging.warning(
-        "Using deterministic presence fallback for tag '%s' after model failure.",
-        tag,
-    )
-    p_json = _build_topic_validation_fallback(
-        tag=tag,
-        semantic_tag=semantic_tag,
-        keywords=combined_match_terms,
-        evidence_snippets=ev_snips,
-        guidance_snippets=g_snips,
-        template_pdf_snippets=pdf_excerpts,
-        validation_error=validation_error,
-    )
+            if validation_error:
+                logging.warning(
+                    "Using deterministic presence fallback for tag '%s' after model failure.",
+                    tag,
+                )
+                p_json = _build_topic_validation_fallback(
+                    tag=tag,
+                    semantic_tag=semantic_tag,
+                    keywords=combined_match_terms,
+                    evidence_snippets=ev_snips,
+                    guidance_snippets=g_snips,
+                    template_pdf_snippets=pdf_excerpts,
+                    validation_error=validation_error,
+                )
 
-status = (
-    (p_json.get("status") if isinstance(p_json, dict) else None) or "MISSING"
-).upper()
-justification = p_json.get("justification", "") if isinstance(p_json, dict) else ""
-result_quality = p_json.get("quality", {}) if isinstance(p_json, dict) else {}
-result_citations = p_json.get("citations", {}) if isinstance(p_json, dict) else {}
-result_validation_error = validation_error
+            status = (
+                (p_json.get("status") if isinstance(p_json, dict) else None) or "MISSING"
+            ).upper()
+            justification = p_json.get("justification", "") if isinstance(p_json, dict) else ""
+            result_quality = p_json.get("quality", {}) if isinstance(p_json, dict) else {}
+            result_citations = p_json.get("citations", {}) if isinstance(p_json, dict) else {}
+            result_validation_error = validation_error
 
-if validation_error and status != "ERROR":
-    result_validation_error = None
+            if validation_error and status != "ERROR":
+                result_validation_error = None
             
             tag_1 = (tag or "").strip().lower()
-            topic_match = semantic_topic_match_strength(semantic_tag combined_match_terms, kws, ev_snips)
+            topic_match = semantic_topic_match_strength(semantic_tag, combined_match_terms, ev_snips)
             topic_alignment = topic_alignment_status(tag, semantic_tag, ev_snips)
 
-            promote_semantic_match =
-            should_promote_semantic_match (
+            promote_semantic_match = should_promote_semantic_match(
                 topic_match=topic_match,
                 topic_alignment=topic_alignment,
                 keywords=combined_match_terms,
                 evidence_snippets=ev_snips,
             )
-            
 
             if promote_semantic_match and status in ("MISSING", "PARTIAL", "ERROR"):
                 status = "PRESENT"
@@ -1887,20 +1893,18 @@ if validation_error and status != "ERROR":
                         f"Topic '{semantic_tag}' was found in the evidence and is well-aligned with the expected template tag '{tag}'. "
                         "Marked PRESENT based on strong semantic match and alignment, despite any numbering or labeling differences."
                     )
-            elif topic_alignment == "misaligned":
-                topic_note = (
-                    f"Topic '{semantic_tag}' appears in the evidence, but not under the expected template tag '{tag}'. "
-                    "Marked PRESENT because the content is present but the section/tag alignment does not match the template."
-                )
+                elif topic_alignment == "misaligned":
+                    topic_note = (
+                        f"Topic '{semantic_tag}' appears in the evidence, but not under the expected template tag '{tag}'. "
+                        "Marked PRESENT because the content is present but the section/tag alignment does not match the template."
+                    )
                 else:
                     topic_note = (
                         f"Topic '{semantic_tag}' was identified in the evidence with a partial semantic match. "
                         "Marked PRESENT based on the presence of relevant content, even though it may not fully meet all criteria or be perfectly aligned."
                     )
                 justification = topic_note
-                result_validation_error = None  
-                if not isinstance(result_citations, dict):
-                    result_citations = ()
+                result_validation_error = None
             
             if tag_1 in ("0.1 nar id", "8.1 nar id", "nar id") and nar_id:
                 status = "PRESENT"
@@ -1916,13 +1920,14 @@ if validation_error and status != "ERROR":
                 status = "PRESENT"
                 justification = f"R-Type '{rtype}' was provided for validation."
                 result_validation_error = None
-            # 1. Run the new Table Guard check
+            
+            # Run the new Table Guard check
             sparse_table_detected = evidence_looks_like_header_only_table(ev_snips)
 
-# 2. If it's just a header, force the status to PARTIAL
+            # If it's just a header, force the status to PARTIAL
             if sparse_table_detected:
                 status = "PARTIAL"
-            justification = f"The evidence for '{semantic_tag}' contains table headers, but no engineering data (IPs, Status, etc.) was found in the rows."
+                justification = f"The evidence for '{semantic_tag}' contains table headers, but no engineering data (IPs, Status, etc.) was found in the rows."
 
             results.append({
                 "intent": intent_name,
