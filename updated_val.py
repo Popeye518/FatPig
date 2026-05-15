@@ -2171,7 +2171,12 @@ def retrieve_evidence_snippets(
     
     return [r[0] for r in rows if r and (r[0] or "").strip()]
 
-def evidence_looks_like_header_only_table(evidence_snippets: List[str]) -> bool:
+def evidence_looks_like_header_only_table(
+    evidence_snippets: List[str],
+    semantic_tag: str,
+    keywords: List[str],
+    structured_items: List[str], 
+) -> bool:
     """Detects if evidence contains only headers/labels without real data values."""
     table_lines = []
     for snippet in evidence_snippets:
