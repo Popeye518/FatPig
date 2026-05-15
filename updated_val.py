@@ -2137,12 +2137,13 @@ def retrieve_evidence_snippets(
     doc_id: Optional[str],
     top_n: int,
 ) -> List[str]:
-    """Retrieve evidence snippets using semantic search."""
-    threshold = 0.65  # STRONG VALIDATOR THRESHOLD: Filters out irrelevant noise
+    """Retrieve evidence snippets using semantic search (clean + stable)."""
+
+    threshold = 0.55  # 🔥 balanced threshold
 
     q_emb = embed_query_text(query)
     vec = _vec_literal(q_emb)
-    
+
     where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype"]
     params = {
         "nar": nar_id,
@@ -2150,32 +2151,33 @@ def retrieve_evidence_snippets(
         "rtype": rtype,
         "vec": vec,
         "topn": top_n,
-        "threshold": threshold
     }
+
     if doc_id:
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
 
+    # 🔥 use ONE metric only (cosine similarity)
     sql = text(f"""
-        SELECT chunk, (embedding <-> CAST(:vec AS vector)) as distance
+        SELECT chunk, (1 - (embedding <=> CAST(:vec AS vector))) as similarity
         FROM {TABLE_EVIDENCE}
         WHERE {" AND ".join(where)}
-          AND (1 - (embedding <=> CAST(:vec AS vector))) > :threshold
-        ORDER BY (1 - (embedding <=> CAST(:vec AS vector))) DESC
+        ORDER BY similarity DESC
         LIMIT :topn
     """)
-    
+
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(sql, params).fetchall()
 
-        filtered = []
-        for r in rows:
-            chunk, distance = r
-            if chunk and chunk.strip() and distance <= 0.6:  # 🔥 threshold
-                filtered.append(chunk)
+    # 🔥 single filtering
+    filtered = []
+    for r in rows:
+        chunk, sim = r
+        if chunk and chunk.strip() and sim >= threshold:
+            filtered.append(chunk)
 
-        return filtered
+    return filtered
 
 def evidence_looks_like_header_only_table(
     evidence_snippets: List[str],
