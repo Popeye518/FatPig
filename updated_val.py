@@ -1007,6 +1007,59 @@ def _normalize_match_text(text_in: str) -> str:
     ).strip()
 
 
+def expand_topic_aliases(
+    tag: str,
+    semantic_tag: str,
+    keywords: List[str],
+    notes: str = "",
+    conds: str = "",
+) -> List[str]:
+    """Add narrow aliases for topics that often vary across evidence sets."""
+    semantic_norm = _normalize_match_text(semantic_tag or tag)
+    existing_norms = {
+        _normalize_match_text(value)
+        for value in [tag, semantic_tag, notes, conds, *[k for k in keywords if isinstance(k, str)]]
+        if (value or "").strip()
+    }
+
+    alias_candidates: List[str] = []
+    if semantic_norm == "logicaldatamodel":
+        alias_candidates = [
+            "logical model",
+            "entity relationship diagram",
+            "entity relationships",
+            "domain decomposition",
+        ]
+    elif semantic_norm == "physicaldatamodel":
+        alias_candidates = [
+            "physical model",
+            "physical schema",
+            "schema design",
+            "partitioning clustering",
+        ]
+    elif semantic_norm == "ingressvolume":
+        alias_candidates = [
+            "inbound volume",
+            "incoming traffic volume",
+            "network ingress",
+        ]
+    elif semantic_norm == "egressvolume":
+        alias_candidates = [
+            "outbound volume",
+            "outgoing traffic volume",
+            "network egress",
+        ]
+
+    aliases: List[str] = []
+    seen = set()
+    for candidate in alias_candidates:
+        normalized = _normalize_match_text(candidate)
+        if normalized and normalized not in existing_norms and normalized not in seen:
+            seen.add(normalized)
+            aliases.append(candidate)
+    return aliases
+
+
 def _normalize_line_text(text_in: str) -> str:
     """Normalize text while preserving word boundaries for line-based matching."""
     return re.sub(
@@ -1036,6 +1089,11 @@ MATCH_STOP_WORDS = {
     "have", "must", "good", "include", "includes", "table", "section",
     "application", "overview", "details", "link", "keep", "applicable",
     "diagram",
+}
+
+TABLE_PLACEHOLDER_TOKENS = {
+    "na", "n", "none", "nil", "null", "tbd", "tbc", "pending",
+    "unknown", "blank", "empty", "todo", "later", "nill",
 }
 
 
@@ -1662,6 +1720,84 @@ def is_table_like_requirement(
     )
 
 
+def _looks_like_tabular_line(raw_line: str) -> bool:
+    """Detect lines that look like extracted table rows."""
+    if "|" in raw_line or "\t" in raw_line:
+        return True
+    if len(re.findall(r"\s{2,}", raw_line or "")) >= 2:
+        return True
+    return raw_line.count(",") >= 2 and len(raw_line) <= 180
+
+
+def _is_placeholder_token(token: str) -> bool:
+    """Treat common filler values as non-substantive table content."""
+    normalized = (token or "").strip().lower()
+    if not normalized:
+        return True
+    if normalized in TABLE_PLACEHOLDER_TOKENS:
+        return True
+    if normalized in {"-", "--", "---", "_", "__", "___"}:
+        return True
+    return False
+
+
+def evidence_looks_like_header_only_table(
+    evidence_snippets: List[str],
+    semantic_tag: str,
+    keywords: List[str],
+    structured_items: List[str],
+) -> bool:
+    """Detect tabular evidence that appears to contain headers but no populated values."""
+    table_lines: List[str] = []
+    for snippet in evidence_snippets:
+        for raw_line in re.split(r"\r?\n", snippet or ""):
+            line = (raw_line or "").strip()
+            if line and _looks_like_tabular_line(line):
+                table_lines.append(line)
+
+    if not table_lines:
+        return False
+
+    header_token_set = {
+        token
+        for phrase in [semantic_tag, *[k for k in keywords if isinstance(k, str)], *structured_items]
+        for token in _tokenize_match_text(phrase)
+        if len(token) > 2 and token not in MATCH_STOP_WORDS
+    }
+
+    substantive_lines = 0
+    header_like_lines = 0
+
+    for line in table_lines:
+        line_tokens = [
+            token
+            for token in _tokenize_match_text(line)
+            if token not in MATCH_STOP_WORDS
+        ]
+        if not line_tokens:
+            continue
+
+        non_placeholder_tokens = [
+            token for token in line_tokens if not _is_placeholder_token(token)
+        ]
+        if not non_placeholder_tokens:
+            header_like_lines += 1
+            continue
+
+        non_header_tokens = [
+            token for token in non_placeholder_tokens if token not in header_token_set
+        ]
+        has_numeric_value = any(any(ch.isdigit() for ch in token) for token in non_placeholder_tokens)
+        has_substantive_value = has_numeric_value or any(len(token) > 2 for token in non_header_tokens)
+
+        if has_substantive_value:
+            substantive_lines += 1
+        else:
+            header_like_lines += 1
+
+    return header_like_lines > 0 and substantive_lines == 0
+
+
 def is_diagram_requirement(
     tag: str,
     notes: str,
@@ -1846,12 +1982,21 @@ def build_per_document_observations(
                 )
             )
         )
+        doc_sparse_table_evidence = evidence_looks_like_header_only_table(
+            doc_snips,
+            semantic_tag,
+            keywords,
+            structured_items,
+        )
+        doc_sparse_table_blocks_present = doc_sparse_table_evidence and not (
+            is_diagram and doc_diagram_ready and bool(doc_diagram_refs)
+        )
         doc_promote = should_promote_semantic_match(
             topic_match=doc_topic_match,
             topic_alignment=doc_topic_alignment,
             keywords=keywords,
             evidence_snippets=doc_snips,
-        ) and doc_structured_ready and doc_diagram_ready
+        ) and doc_structured_ready and doc_diagram_ready and not doc_sparse_table_blocks_present
 
         if doc_promote:
             doc_status = "PRESENT"
@@ -1867,6 +2012,11 @@ def build_per_document_observations(
                 doc_justification = (
                     f"Document '{doc_key}' contains a strong semantic match for topic '{semantic_tag}'."
                 )
+        elif doc_sparse_table_blocks_present and doc_snips:
+            doc_status = "PARTIAL"
+            doc_justification = (
+                f"Document '{doc_key}' contains a table/header for topic '{semantic_tag}', but the retrieved table appears unpopulated or header-only."
+            )
         elif enforce_structured_items and (
             doc_structured_coverage["matched_count"]
             or doc_topic_match in ("exact", "partial")
@@ -1916,6 +2066,7 @@ def build_per_document_observations(
             "matched_requirement_items": doc_structured_coverage["matched_items"],
             "missing_requirement_items": doc_structured_coverage["missing_items"],
             "diagram_reference_alignment": doc_diagram_ref_alignment,
+            "header_only_table_detected": doc_sparse_table_evidence,
         })
 
     return observations
@@ -2357,10 +2508,12 @@ def run_validation(
         kws = child.get("keywords") or []
         structured_items = extract_structured_requirement_items(notes, conds)
         requirement_phrases = extract_requirement_phrases(notes, conds)
+        alias_terms = expand_topic_aliases(tag, semantic_tag, kws, notes, conds)
         combined_match_terms: List[str] = []
         seen_match_terms = set()
         for candidate in [
             *[k for k in kws if isinstance(k, str)],
+            *alias_terms,
             *requirement_phrases,
             *structured_items,
         ]:
@@ -2396,8 +2549,7 @@ def run_validation(
         topic_search_phrases = build_topic_search_phrases(
             semantic_tag,
             tag,
-            kws,
-            requirement_phrases=requirement_phrases,
+            combined_match_terms,
         )
         query_full = topic_queries[0] if topic_queries else " ".join(
             s for s in [semantic_tag, kw_text] if s
@@ -2652,6 +2804,12 @@ def run_validation(
         structured_partially_covered = requirement_items_partially_covered(
             structured_item_coverage
         )
+        sparse_table_evidence = evidence_looks_like_header_only_table(
+            ev_snips,
+            semantic_tag,
+            combined_match_terms,
+            structured_items,
+        )
         topic_alignment = topic_alignment_status(tag, semantic_tag, ev_snips)
         structured_ready_for_present = (
             not enforce_structured_items
@@ -2679,12 +2837,15 @@ def run_validation(
                 )
             )
         )
+        sparse_table_blocks_present = sparse_table_evidence and not (
+            is_diagram and diagram_ready_for_present and bool(mm_hits)
+        )
         promote_semantic_match = should_promote_semantic_match(
             topic_match=topic_match,
             topic_alignment=topic_alignment,
             keywords=combined_match_terms,
             evidence_snippets=ev_snips,
-        ) and structured_ready_for_present and diagram_ready_for_present
+        ) and structured_ready_for_present and diagram_ready_for_present and not sparse_table_blocks_present
 
         if promote_semantic_match and status in ("MISSING", "PARTIAL", "ERROR"):
             status = "PRESENT"
@@ -2723,6 +2884,18 @@ def run_validation(
         if tag_1 in ("0.3 r-type", "0.3 r type", "r-type", "r type", "rtype") and rtype:
             status = "PRESENT"
             justification = f"R-Type '{rtype}' was provided for validation."
+
+        if sparse_table_blocks_present and status == "PRESENT":
+            status = "PARTIAL" if ev_snips else "MISSING"
+            justification = (
+                f"Topic '{semantic_tag}' matched a table/header, but the retrieved evidence looks like an unpopulated or header-only table without substantive values."
+            )
+
+        if sparse_table_blocks_present and status in ("MISSING", "EMPTY", "ERROR") and ev_snips:
+            status = "PARTIAL"
+            justification = (
+                f"Topic '{semantic_tag}' appears as a table/header in the evidence, but the table values do not look populated enough to confirm full coverage."
+            )
 
         if enforce_structured_items and status == "PRESENT" and not structured_ready_for_present:
             missing_items_text = ", ".join(structured_item_coverage["missing_items"][:4]) or "none"
@@ -2838,6 +3011,7 @@ def run_validation(
             "diagram_expected": is_diagram,
             "diagram_reference_alignment": diagram_ref_alignment,
             "diagram_ready_for_present": diagram_ready_for_present,
+            "header_only_table_detected": sparse_table_evidence,
             "document_consistency": document_consistency,
             "per_document_observations": per_document_observations,
             "evidence_document_count": len(candidate_doc_ids),
