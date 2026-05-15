@@ -1741,63 +1741,6 @@ def _is_placeholder_token(token: str) -> bool:
     return False
 
 
-def evidence_looks_like_header_only_table(
-    evidence_snippets: List[str],
-    semantic_tag: str,
-    keywords: List[str],
-    structured_items: List[str],
-) -> bool:
-    """Detect tabular evidence that appears to contain headers but no populated values."""
-    table_lines: List[str] = []
-    for snippet in evidence_snippets:
-        for raw_line in re.split(r"\r?\n", snippet or ""):
-            line = (raw_line or "").strip()
-            if line and _looks_like_tabular_line(line):
-                table_lines.append(line)
-
-    if not table_lines:
-        return False
-
-    header_token_set = {
-        token
-        for phrase in [semantic_tag, *[k for k in keywords if isinstance(k, str)], *structured_items]
-        for token in _tokenize_match_text(phrase)
-        if len(token) > 2 and token not in MATCH_STOP_WORDS
-    }
-
-    substantive_lines = 0
-    header_like_lines = 0
-
-    for line in table_lines:
-        line_tokens = [
-            token
-            for token in _tokenize_match_text(line)
-            if token not in MATCH_STOP_WORDS
-        ]
-        if not line_tokens:
-            continue
-
-        non_placeholder_tokens = [
-            token for token in line_tokens if not _is_placeholder_token(token)
-        ]
-        if not non_placeholder_tokens:
-            header_like_lines += 1
-            continue
-
-        non_header_tokens = [
-            token for token in non_placeholder_tokens if token not in header_token_set
-        ]
-        has_numeric_value = any(any(ch.isdigit() for ch in token) for token in non_placeholder_tokens)
-        has_substantive_value = has_numeric_value or any(len(token) > 2 for token in non_header_tokens)
-
-        if has_substantive_value:
-            substantive_lines += 1
-        else:
-            header_like_lines += 1
-
-    return header_like_lines > 0 and substantive_lines == 0
-
-
 def is_diagram_requirement(
     tag: str,
     notes: str,
@@ -2150,6 +2093,8 @@ def retrieve_evidence_records(
     top_n: int,
 ) -> List[Dict[str, str]]:
     """Retrieve evidence snippets with doc_id metadata using semantic search."""
+    threshold = 0.65  # STRONG VALIDATOR THRESHOLD: Filters out irrelevant noise
+
     q_emb = embed_query_text(query)
     vec = _vec_literal(q_emb)
     where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype"]
@@ -2159,20 +2104,24 @@ def retrieve_evidence_records(
         "rtype": rtype,
         "vec": vec,
         "topn": top_n,
+        "threshold": threshold
     }
     if doc_id:
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
+        
     sql = text(f"""
         SELECT doc_id, chunk
         FROM {TABLE_EVIDENCE}
         WHERE {" AND ".join(where)}
-        ORDER BY embedding <-> CAST(:vec AS vector)
+          AND (1 - (embedding <=> CAST(:vec AS vector))) > :threshold
+        ORDER BY (1 - (embedding <=> CAST(:vec AS vector))) DESC
         LIMIT :topn
     """)
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(sql, params).fetchall()
+        
     return [
         {"doc_id": str(r[0] or ""), "snippet": r[1]}
         for r in rows
@@ -2187,9 +2136,10 @@ def retrieve_evidence_snippets(
     rtype: str,
     doc_id: Optional[str],
     top_n: int,
-    threshold: float = 0.65  # This is the "Strong" gate
 ) -> List[str]:
-    """Retrieve evidence snippets with a strict similarity score threshold."""
+    """Retrieve evidence snippets using semantic search."""
+    threshold = 0.65  # STRONG VALIDATOR THRESHOLD: Filters out irrelevant noise
+
     q_emb = embed_query_text(query)
     vec = _vec_literal(q_emb)
     
@@ -2206,13 +2156,12 @@ def retrieve_evidence_snippets(
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
 
-    # The SQL now filters out anything that isn't a 65% match or higher
     sql = text(f"""
-        SELECT chunk, (1 - (embedding <=> CAST(:vec AS vector))) as score
+        SELECT chunk
         FROM {TABLE_EVIDENCE}
         WHERE {" AND ".join(where)}
           AND (1 - (embedding <=> CAST(:vec AS vector))) > :threshold
-        ORDER BY score DESC
+        ORDER BY (1 - (embedding <=> CAST(:vec AS vector))) DESC
         LIMIT :topn
     """)
     
@@ -3015,13 +2964,6 @@ def run_validation(
             variance_note = "Per-document coverage varies: " + "; ".join(variance_parts) + "."
             justification = (f"{justification} {variance_note}" if justification else variance_note).strip()
 
-        # 1. Run the new Table Guard check
-        sparse_table_detected = evidence_looks_like_header_only_table(ev_snips)
-
-        # 2. If it's just a header, force the status to PARTIAL
-        if sparse_table_detected:
-            status = "PARTIAL"
-            justification = f"The evidence for '{semantic_tag}' contains table headers, but no engineering data (IPs, Status, etc.) was found in the rows."
 
 
         results.append({
