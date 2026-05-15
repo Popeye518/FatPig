@@ -2157,7 +2157,7 @@ def retrieve_evidence_snippets(
         params["doc_id"] = doc_id
 
     sql = text(f"""
-        SELECT chunk
+        SELECT chunk, (embedding <-> CAST(:vec AS vector)) as distance
         FROM {TABLE_EVIDENCE}
         WHERE {" AND ".join(where)}
           AND (1 - (embedding <=> CAST(:vec AS vector))) > :threshold
@@ -2168,8 +2168,14 @@ def retrieve_evidence_snippets(
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(sql, params).fetchall()
-    
-    return [r[0] for r in rows if r and (r[0] or "").strip()]
+
+        filtered = []
+        for r in rows:
+            chunk, distance = r
+            if chunk and chunk.strip() and distance <= 0.6:  # 🔥 threshold
+                filtered.append(chunk)
+
+        return filtered
 
 def evidence_looks_like_header_only_table(
     evidence_snippets: List[str],
