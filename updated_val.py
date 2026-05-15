@@ -2549,7 +2549,7 @@ def run_validation(
             max_total_chars=2600,
         )
 
-        g_snips = retrieve_guidance_snippets(query_full, rtype, top_n=3)
+        g_snips = retrieve_evidence_snippets(query_full, nar_id, release_number, rtype, effective_doc_id, top_n=3)
         g_join = build_compact_prompt_block(
             g_snips,
             empty_value="(no guidance context)",
