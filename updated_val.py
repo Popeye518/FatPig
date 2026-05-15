@@ -2533,7 +2533,8 @@ def run_validation(
             notes,
             conds,
             source,
-            required_items,
+            (task.get("expectedElements", []) or []) +
+            (task.get("expectedTableColumns", []) or [])
         ) and len(structured_items) >= 2
         structured_items_block = ", ".join(structured_items) if structured_items else "(none)"
 
