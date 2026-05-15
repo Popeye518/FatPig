@@ -897,76 +897,82 @@ def _build_topic_validation_fallback(
     is_diagram: bool = False,
     diagram_refs: Optional[List[Dict[str, str]]] = None,
 ) -> Dict[str, Any]:
-
+    """Build a deterministic topic-level fallback when the model returns unusable output."""
     diagram_refs = diagram_refs or []
-
-    # 🔥 NEW: scoring function
-    def compute_simple_score():
-        text = " ".join(evidence_snippets).lower()
-
-        combined_keywords = (keywords or []) + ([semantic_tag] if semantic_tag else [])
-
-        if not combined_keywords:
-            return 0.5 if evidence_snippets else 0
-
-        matched = sum(1 for kw in combined_keywords if kw.lower() in text)
-        keyword_score = matched / len(combined_keywords)
-
-        length_score = min(len(text) / 500, 1)
-
-        return 0.7 * keyword_score + 0.3 * length_score
-
-    score = compute_simple_score()
-
+    topic_match = semantic_topic_match_strength(
+        semantic_tag, keywords, evidence_snippets
+    )
     evidence_present = bool(evidence_snippets)
     diagram_present = bool(diagram_refs)
 
-    # 🔥 NEW: status decision (replaces old logic)
     if is_diagram:
-        if diagram_present:
-            score = max(score, 0.8)  # boost for real diagram
+        if diagram_present or topic_match in ("exact", "partial"):
+            status = "PRESENT"
+        elif evidence_present:
+            status = "PARTIAL"
+        else:
+            status = "MISSING"
 
-    if score >= 0.75:
-        status = "PRESENT"
-    elif score >= 0.4:
-        status = "PARTIAL"
+        quality = {
+            "completeness": 4 if diagram_present else (3 if evidence_present else 0),
+            "specificity": 4 if diagram_present else (2 if evidence_present else 0),
+            "diagram_alignment": 4 if diagram_present else (2 if evidence_present else 0),
+        }
+
+        justification = (
+            f"Used deterministic fallback for '{tag}' because the model returned "
+            f"unusable output. Diagram references found: {len(diagram_refs)}; "
+            f"evidence snippets found: {len(evidence_snippets)}."
+        )
+
+        citations = {
+            "diagram": [
+                _truncate_text(ref.get("caption", ""), 180)
+                for ref in diagram_refs[:2]
+            ],
+            "text": [
+                _truncate_text(snippet, 180)
+                for snippet in evidence_snippets[:2]
+            ],
+            "template_pdf": [
+                _truncate_text(snippet, 180)
+                for snippet in template_pdf_snippets[:1]
+            ],
+        }
     else:
-        status = "MISSING"
+        if topic_match in ("exact", "partial"):
+            status = "PRESENT"
+        elif evidence_present:
+            status = "PARTIAL"
+        else:
+            status = "MISSING"
 
-    # 🔧 QUALITY (slightly aligned with score)
-    quality = {
-        "completeness": int(score * 4),
-        "specificity": int(score * 4),
-        "traceability": 3 if evidence_present else 0,
-    }
+        quality = {
+            "completeness": 4 if topic_match == "exact" else (3 if evidence_present else 0),
+            "specificity": 4 if topic_match == "exact" else (2 if evidence_present else 0),
+            "traceability": 3 if evidence_present else 0,
+        }
 
-    justification = (
-        f"Fallback used for '{tag}'. "
-        f"Score={round(score,2)}, Evidence={len(evidence_snippets)}, "
-        f"Diagrams={len(diagram_refs)}."
-    )
+        justification = (
+            f"Used deterministic fallback for '{tag}' because the model returned "
+            f"unusable output. Evidence snippets found: {len(evidence_snippets)}; "
+            f"semantic match={topic_match or 'none'}."
+        )
 
-    # citations same as before
-    citations = {
-        "evidence": [
-            _truncate_text(snippet, 180)
-            for snippet in evidence_snippets[:2]
-        ],
-        "guidance": [
-            _truncate_text(snippet, 180)
-            for snippet in guidance_snippets[:1]
-        ],
-        "template_pdf": [
-            _truncate_text(snippet, 180)
-            for snippet in template_pdf_snippets[:1]
-        ],
-    }
-
-    if is_diagram:
-        citations["diagram"] = [
-            _truncate_text(ref.get("caption", ""), 180)
-            for ref in diagram_refs[:2]
-        ]
+        citations = {
+            "evidence": [
+                _truncate_text(snippet, 180)
+                for snippet in evidence_snippets[:2]
+            ],
+            "guidance": [
+                _truncate_text(snippet, 180)
+                for snippet in guidance_snippets[:1]
+            ],
+            "template_pdf": [
+                _truncate_text(snippet, 180)
+                for snippet in template_pdf_snippets[:1]
+            ],
+        }
 
     return {
         "status": status,
@@ -1292,10 +1298,19 @@ def retrieve_evidence_snippets(
     rtype: str,
     doc_id: Optional[str],
     top_n: int,
+    keywords: Optional[List[str]] = None,
 ) -> List[str]:
     """Retrieve evidence snippets using semantic search."""
-    q_emb = embed_query_text(query)
+
+    # 🔥 NEW: enrich query (MAIN FIX)
+    enriched_query = " ".join([
+        query or "",
+        " ".join(keywords or [])
+    ]).strip()
+
+    q_emb = embed_query_text(enriched_query)
     vec = _vec_literal(q_emb)
+
     where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype"]
     params = {
         "nar": nar_id,
@@ -1304,9 +1319,11 @@ def retrieve_evidence_snippets(
         "vec": vec,
         "topn": top_n,
     }
+
     if doc_id:
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
+
     sql = text(f"""
         SELECT chunk
         FROM {TABLE_EVIDENCE}
@@ -1314,9 +1331,11 @@ def retrieve_evidence_snippets(
         ORDER BY embedding <-> CAST(:vec AS vector)
         LIMIT :topn
     """)
+
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(sql, params).fetchall()
+
     return [r[0] for r in rows if r and (r[0] or "").strip()]
 
 
@@ -1324,11 +1343,20 @@ def retrieve_guidance_snippets(
     query: str,
     rtype: str,
     top_n: int = 3,
+    keywords: Optional[List[str]] = None,
 ) -> List[str]:
     """Retrieve guidance snippets."""
+
     try:
-        qv = embed_query_text(query)
+        # 🔥 NEW: enrich query
+        enriched_query = " ".join([
+            query or "",
+            " ".join(keywords or [])
+        ]).strip()
+
+        qv = embed_query_text(enriched_query)
         vec = _vec_literal(qv)
+
         sql = text(f"""
             SELECT chunk
             FROM {TABLE_GUIDANCE}
@@ -1336,10 +1364,17 @@ def retrieve_guidance_snippets(
             ORDER BY embedding <-> CAST(:vec AS vector)
             LIMIT :topn
         """)
+
         engine = get_engine()
         with engine.connect() as c:
-            rows = c.execute(sql, {"rtype": rtype, "vec": vec, "topn": top_n}).fetchall()
+            rows = c.execute(sql, {
+                "rtype": rtype,
+                "vec": vec,
+                "topn": top_n
+            }).fetchall()
+
         return [r[0] for r in rows if r and r[0]]
+
     except Exception as e:
         logging.warning(f"guidance retrieval failed: {e}")
         return []
@@ -1353,10 +1388,19 @@ def retrieve_mm_diagrams(
     doc_id: Optional[str],
     top_n: int = 3,
     dim: int = MM_DIM,
+    keywords: Optional[List[str]] = None,
 ) -> List[Dict[str, str]]:
     """Retrieve multimodal diagram references."""
-    qv = mm_embed_text(query_text, dim)
+
+    # 🔥 NEW: enrich query
+    enriched_query = " ".join([
+        query_text or "",
+        " ".join(keywords or [])
+    ]).strip()
+
+    qv = mm_embed_text(enriched_query, dim)
     vec = _vec_literal(qv)
+
     where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype"]
     params: Dict[str, Any] = {
         "nar": nar_id,
@@ -1365,9 +1409,11 @@ def retrieve_mm_diagrams(
         "vec": vec,
         "topn": top_n,
     }
+
     if doc_id:
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
+
     sql = text(f"""
         SELECT caption, doc_uri
         FROM {TABLE_MM_EVID}
@@ -1375,11 +1421,12 @@ def retrieve_mm_diagrams(
         ORDER BY embedding <-> CAST(:vec AS vector)
         LIMIT :topn
     """)
+
     engine = get_engine()
     with engine.connect() as c:
         rows = c.execute(sql, params).fetchall()
-    return [{"caption": r[0], "doc_uri": r[1]} for r in rows]
 
+    return [{"caption": r[0], "doc_uri": r[1]} for r in rows]
 
 # ============================================================================
 # LLM PROMPTS
