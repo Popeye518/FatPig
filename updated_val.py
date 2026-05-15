@@ -1721,13 +1721,43 @@ def is_table_like_requirement(
 
 
 def _looks_like_tabular_line(raw_line: str) -> bool:
-    """Detect lines that look like extracted table rows."""
-    if "|" in raw_line or "\t" in raw_line:
-        return True
-    if len(re.findall(r"\s{2,}", raw_line or "")) >= 2:
-        return True
-    return raw_line.count(",") >= 2 and len(raw_line) <= 180
+    """Detect lines that look like extracted table rows (strong version)."""
+    if not raw_line:
+        return False
 
+    line = raw_line.strip()
+
+    # clear separators
+    if "|" in line or "\t" in line:
+        return True
+
+    # multiple spaces (PDF column split)
+    if len(re.findall(r"\s{2,}", line)) >= 2:
+        return True
+
+    # comma-separated short row
+    if line.count(",") >= 2 and len(line) < 200:
+        return True
+
+    # numeric-heavy structured rows
+    tokens = line.split()
+    numeric_tokens = sum(1 for t in tokens if any(c.isdigit() for c in t))
+    if len(tokens) >= 3 and numeric_tokens >= 1:
+        return True
+
+    return False
+
+def is_table_chunk(chunk: str) -> bool:
+    """Detect if a chunk contains table-like structure."""
+    if not chunk:
+        return False
+
+    lines = chunk.split("\n")
+
+    table_lines = sum(1 for l in lines if _looks_like_tabular_line(l))
+
+    # if multiple lines look structured → table
+    return table_lines >= 2
 
 def _is_placeholder_token(token: str) -> bool:
     """Treat common filler values as non-substantive table content."""
@@ -2137,9 +2167,9 @@ def retrieve_evidence_snippets(
     doc_id: Optional[str],
     top_n: int,
 ) -> List[str]:
-    """Retrieve evidence snippets using semantic search (clean + stable)."""
+    """Retrieve evidence snippets using semantic search + re-ranking."""
 
-    threshold = 0.55  # 🔥 balanced threshold
+    threshold = 0.50  # slightly relaxed
 
     q_emb = embed_query_text(query)
     vec = _vec_literal(q_emb)
@@ -2150,14 +2180,13 @@ def retrieve_evidence_snippets(
         "rel": release_number,
         "rtype": rtype,
         "vec": vec,
-        "topn": top_n,
+        "topn": 15,  # 🔥 fetch more initially
     }
 
     if doc_id:
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
 
-    # 🔥 use ONE metric only (cosine similarity)
     sql = text(f"""
         SELECT chunk, (1 - (embedding <=> CAST(:vec AS vector))) as similarity
         FROM {TABLE_EVIDENCE}
@@ -2170,44 +2199,32 @@ def retrieve_evidence_snippets(
     with engine.connect() as conn:
         rows = conn.execute(sql, params).fetchall()
 
-    # 🔥 single filtering
-    filtered = []
+    # 🔥 RE-RANK in Python
+    scored = []
     for r in rows:
         chunk, sim = r
-        if chunk and chunk.strip() and sim >= threshold:
-            filtered.append(chunk)
+        if not chunk or not chunk.strip():
+            continue
 
-    return filtered
+        # 🔥 keyword boost
+        keyword_bonus = 0
+        query_words = query.lower().split()
+        text = chunk.lower()
 
-def evidence_looks_like_header_only_table(
-    evidence_snippets: List[str],
-    semantic_tag: str,
-    keywords: List[str],
-    structured_items: List[str], 
-) -> bool:
-    """Detects if evidence contains only headers/labels without real data values."""
-    table_lines = []
-    for snippet in evidence_snippets:
-        for raw_line in re.split(r"\r?\n", snippet or ""):
-            line = (raw_line or "").strip()
-            # If line has pipes (|) or multiple spaces, it's likely a table row
-            if line and (line.count('|') >= 1 or line.count('  ') >= 2):
-                table_lines.append(line)
+        matches = sum(1 for w in query_words if w in text)
+        if matches > 0:
+            keyword_bonus = matches / len(query_words)
 
-    if not table_lines: 
-        return False
+        final_score = 0.7 * sim + 0.3 * keyword_bonus
 
-    # These are "Data Signals" (IPs, Version numbers, Status words, etc.)
-    data_signal_pattern = re.compile(
-        r"(\d{1,3}\.\d{1,3}\.\d{1,3}|v\d+\.\d+|active|enabled|disabled|true|false|pass|fail|0x[0-9a-f]+|\d{4}-\d{2}-\d{2})", 
-        re.IGNORECASE
-    )
+        if final_score >= threshold:
+            scored.append((final_score, chunk))
 
-    # Count lines that actually contain a data signal
-    substantive_lines = sum(1 for line in table_lines if data_signal_pattern.search(line))
-    
-    # If we have a table but ZERO substantive data, it's just a header
-    return len(table_lines) > 0 and substantive_lines == 0
+    # 🔥 sort + keep top 5 only
+    scored.sort(reverse=True, key=lambda x: x[0])
+    final_chunks = [c for _, c in scored[:5]]
+
+    return final_chunks
 
 def retrieve_mm_diagrams(
     query_text: str,
@@ -2516,7 +2533,7 @@ def run_validation(
             notes,
             conds,
             source,
-            structured_items,
+            required_items,
         ) and len(structured_items) >= 2
         structured_items_block = ", ".join(structured_items) if structured_items else "(none)"
 
