@@ -2528,12 +2528,17 @@ def run_validation(
                 seen_match_terms.add(normalized_candidate)
                 combined_match_terms.append(candidate)
 
+        required_items = (
+        (child.get("expectedElements") or []) +
+        (child.get("expectedTableColumns") or [])
+        )
+
         enforce_structured_items = is_table_like_requirement(
             tag,
             notes,
             conds,
             source,
-            task.get("expectedElements", [])
+            required_items
         ) and len(structured_items) >= 2
         structured_items_block = ", ".join(structured_items) if structured_items else "(none)"
 
