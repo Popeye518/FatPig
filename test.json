@@ -1,0 +1,67 @@
+Here is the shape I recommend for each leaf node:
+{
+  "tag": "1.2 Go-live dates",
+  "musthave": true,
+  "goodToHave": false,
+  "notes": "Tech Go-Live and Business Go-Live with dates and implementation phase.",
+  "keywords": ["Go-live dates", "Incremental Reviews"],
+
+  "field_paths": [
+    "release.tech_go_live_date",
+    "release.business_go_live_date",
+    "release.implementation_phase"
+  ],
+  "check_type": "all_required",
+  "expected_type": "date_block",
+  "empty_values": ["", null, "N/A", "TBD", "UNKNOWN"],
+  "report_as": "Go-live dates",
+  "validation_notes": "All three values must be available to mark PRESENT."
+}
+
+For nested object sections
+Use this when one section is an object and you want to validate internal fields:
+{
+  "tag": "2.2 Application Stakeholders",
+  "musthave": true,
+  "goodToHave": false,
+  "notes": "List ITAO, Delegate, Lead SA, Cloud Architect, Technical Lead, PMO.",
+  "keywords": ["Application Stakeholders"],
+
+  "field_paths": ["stakeholders"],
+  "check_type": "object_complete",
+  "required_fields": [
+    "itao",
+    "lead_sa",
+    "cloud_architect",
+    "technical_lead"
+  ],
+  "expected_type": "object",
+  "empty_values": ["", null, "N/A", "TBD"],
+  "report_as": "Application Stakeholders"
+}
+
+For list or table sections
+Use this for phase tables, ADR tables, approval history, change history:
+{
+  "tag": "1.1.a Phase Table",
+  "musthave": true,
+  "goodToHave": false,
+  "notes": "Include Phase Number, Approximate Implementation Date, Overview.",
+  "keywords": [],
+
+  "field_paths": ["migration.phase_table"],
+  "check_type": "min_items",
+  "expected_type": "list",
+  "min_items": 1,
+  "required_fields": [
+    "phase_number",
+    "implementation_date",
+    "overview"
+  ],
+  "empty_values": ["", null, "N/A", "TBD"],
+  "report_as": "Phase Table"
+}
+
+
+
+
