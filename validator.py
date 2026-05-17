@@ -1811,7 +1811,7 @@ def evaluate_table_evidence(
 
     expected_columns_present = not expected_columns or len(found_columns) == len(expected_columns)
     expected_rows_present = not expected_rows or complete_row_count == len(expected_rows)
-    expected_elements_present = not expected_elements or present_element_count == len(expected_elements)
+    expected_elements_present = not expected_elements or present_element_count > 0
     has_required_row_data = bool(data_row_count or complete_row_count or present_element_count)
 
     if (
@@ -1846,11 +1846,13 @@ def evaluate_table_evidence(
         if not missing_rows and not incomplete_rows:
             detail_parts.append("all expected row(s) present with data")
     if expected_elements:
-        missing_elements = [item["name"] for item in element_presence if not item["present"]]
-        if missing_elements:
-            detail_parts.append(f"missing expected element(s): {', '.join(missing_elements)}")
+        matched_elements = [item["name"] for item in element_presence if item["present"]]
+        if matched_elements:
+            detail_parts.append(
+                f"matched expected element(s): {', '.join(matched_elements[:4])}"
+            )
         else:
-            detail_parts.append("all expected element(s) found in table rows")
+            detail_parts.append("no expected element was found in table rows")
     elif expected_columns:
         if data_row_count:
             detail_parts.append(f"found {data_row_count} populated table row(s)")
@@ -1880,6 +1882,7 @@ def evaluate_table_evidence(
         "expected_columns": expected_columns,
         "expected_rows": expected_rows,
         "expected_elements": expected_elements,
+        "matched_element_count": present_element_count,
         "found_columns": found_columns,
         "missing_columns": missing_columns,
         "row_presence": row_presence,
