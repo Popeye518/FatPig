@@ -64,7 +64,7 @@ LLM_MODEL = os.getenv("VERTEX_LLM_MODEL", "gemini-2.5-flash")
 MM_EMBED_MODEL = os.getenv("VERTEX_MM_EMBED_MODEL", "multimodalembedding@001")
 
 # Embedding Dimensions
-MM_DIM = int(os.getenv("VERTEX_MM_DIM", "1488"))
+MM_DIM = int(os.getenv("VERTEX_MM_DIM", "1408"))
 
 # Cloud SQL Connector Configuration
 INSTANCE_CONNECTION_NAME = os.getenv("INSTANCE_CONNECTION_NAME", "")
@@ -156,6 +156,62 @@ def get_engine() -> sqlalchemy.Engine:
         _engine = build_engine()
         logging.info("SQLAlchemy engine created via Cloud SQL Connector (pg8000).")
     return _engine
+
+
+def _get_column_format_type(table_name: str, column_name: str) -> Optional[str]:
+    """Return PostgreSQL's formatted column type, e.g. vector(1408)."""
+    engine = get_engine()
+    sql = text("""
+        SELECT format_type(a.atttypid, a.atttypmod) AS format_type
+        FROM pg_attribute a
+        JOIN pg_class c ON c.oid = a.attrelid
+        JOIN pg_namespace n ON n.oid = c.relnamespace
+        WHERE c.relname = :table_name
+          AND a.attname = :column_name
+          AND a.attnum > 0
+          AND NOT a.attisdropped
+        ORDER BY CASE WHEN n.nspname = current_schema() THEN 0 ELSE 1 END, n.nspname
+        LIMIT 1
+    """)
+    with engine.connect() as conn:
+        row = conn.execute(sql, {"table_name": table_name, "column_name": column_name}).first()
+    return row[0] if row and row[0] else None
+
+
+def _parse_vector_dimension(format_type_name: Optional[str]) -> Optional[int]:
+    """Parse a vector(N) type string into its dimension."""
+    if not format_type_name:
+        return None
+    match = re.fullmatch(r"vector\((\d+)\)", format_type_name.strip(), flags=re.IGNORECASE)
+    return int(match.group(1)) if match else None
+
+
+def validate_runtime_contract(mm_dim: int) -> None:
+    """Fail fast when runtime configuration does not match the database contract."""
+    if EMBED_DIM is not None:
+        text_embedding_type = _get_column_format_type(TABLE_EVIDENCE, "embedding")
+        text_embedding_dim = _parse_vector_dimension(text_embedding_type)
+        if text_embedding_dim != EMBED_DIM:
+            raise RuntimeError(
+                f"{TABLE_EVIDENCE}.embedding expects {text_embedding_type or 'unknown'}, "
+                f"but {EMBED_MODEL} is configured for dimension {EMBED_DIM}."
+            )
+
+    guidance_embedding_type = _get_column_format_type(TABLE_GUIDANCE, "embedding")
+    guidance_embedding_dim = _parse_vector_dimension(guidance_embedding_type)
+    if guidance_embedding_dim is not None and EMBED_DIM is not None and guidance_embedding_dim != EMBED_DIM:
+        raise RuntimeError(
+            f"{TABLE_GUIDANCE}.embedding expects {guidance_embedding_type}, "
+            f"but {EMBED_MODEL} is configured for dimension {EMBED_DIM}."
+        )
+
+    mm_embedding_type = _get_column_format_type(TABLE_MM_EVID, "embedding")
+    mm_embedding_dim = _parse_vector_dimension(mm_embedding_type)
+    if mm_embedding_dim != mm_dim:
+        raise RuntimeError(
+            f"{TABLE_MM_EVID}.embedding expects {mm_embedding_type or 'unknown'}, "
+            f"but VERTEX_MM_DIM is configured for dimension {mm_dim}."
+        )
 
 
 def shutdown_connector():
@@ -347,6 +403,63 @@ def parse_json(s: str) -> Dict[str, Any]:
         return {}
 
 
+def parse_json_with_error(s: str) -> Tuple[Dict[str, Any], Optional[str], str]:
+    """Parse JSON and preserve parser failures as structured errors."""
+    cleaned = (s or "").strip()
+    if cleaned.startswith("```json"):
+        cleaned = cleaned[7:]
+    if cleaned.startswith("```"):
+        cleaned = cleaned[3:]
+    if cleaned.endswith("```"):
+        cleaned = cleaned[:-3]
+    cleaned = cleaned.strip()
+    if not cleaned:
+        return {}, "empty model response", cleaned
+    try:
+        parsed = json.loads(cleaned)
+    except Exception as exc:
+        return {}, f"JSON parse failed: {exc}", cleaned
+    if not isinstance(parsed, dict):
+        return {}, f"Expected JSON object, got {type(parsed).__name__}", cleaned
+    return parsed, None, cleaned
+
+
+def generate_structured_json(prompt: str, response_kind: str) -> Tuple[Dict[str, Any], Optional[str]]:
+    """Generate structured JSON with one repair retry when parsing fails."""
+    raw_response = gen_text(prompt)
+    parsed, error, cleaned = parse_json_with_error(raw_response)
+    if error is None:
+        return parsed, None
+
+    logging.warning(f"{response_kind} JSON parse failed on first attempt: {error}")
+
+    repair_prompt = (
+        f"{prompt}\n\n"
+        "Your previous response was not valid JSON. "
+        "Return STRICT JSON ONLY that matches the requested schema and do not include markdown fences.\n\n"
+        "Previous invalid response:\n"
+        f"{cleaned[:4000]}"
+    )
+    repaired_response = gen_text(repair_prompt)
+    repaired, repair_error, repaired_cleaned = parse_json_with_error(repaired_response)
+    if repair_error is None:
+        return repaired, None
+
+    combined_error = f"{error}; retry failed: {repair_error}"
+    logging.error(f"{response_kind} JSON parse failed after retry: {combined_error}")
+    return {
+        "status": "ERROR",
+        "quality": {},
+        "justification": (
+            f"Validator could not parse model output for {response_kind}. "
+            "Review logs and retrieved evidence context."
+        ),
+        "citations": {},
+        "validator_error": combined_error,
+        "raw_response_excerpt": repaired_cleaned[:500],
+    }, combined_error
+
+
 # ============================================================================
 # Document Processing
 # ============================================================================
@@ -494,7 +607,7 @@ def retrieve_keyword_evidence_snippets(
     nar_id: str,
     release_number: str,
     rtype: str,
-    doc_hash: Optional[str],
+    doc_id: Optional[str],
     top_n: int,
 ) -> List[str]:
     """Retrieve evidence snippets using keyword matching."""
@@ -514,9 +627,9 @@ def retrieve_keyword_evidence_snippets(
         "rtype": rtype,
         "topn": top_n,
     }
-    if doc_hash:
-        where.append("doc_hash=:doch")
-        params["doch"] = doc_hash
+    if doc_id:
+        where.append("doc_id=:doc_id")
+        params["doc_id"] = doc_id
     phrase_conditions = []
     exact_checks = []
     for idx, (raw_phrase, normalized_phrase) in enumerate(valid_phrases):
@@ -547,7 +660,7 @@ def retrieve_topic_evidence_snippets(
     nar_id: str,
     release_number: str,
     rtype: str,
-    doc_hash: Optional[str],
+    doc_id: Optional[str],
     top_n: int,
     search_phrases: Optional[List[str]] = None,
 ) -> List[str]:
@@ -557,7 +670,7 @@ def retrieve_topic_evidence_snippets(
     seen = set()
     if search_phrases:
         lexical_hits = retrieve_keyword_evidence_snippets(
-            search_phrases, nar_id, release_number, rtype, doc_hash, top_n
+            search_phrases, nar_id, release_number, rtype, doc_id, top_n
         )
         for snippet in lexical_hits:
             normalized = _normalize_match_text(snippet)
@@ -568,7 +681,7 @@ def retrieve_topic_evidence_snippets(
             return merged
     for query in queries:
         snippets = retrieve_evidence_snippets(
-            query, nar_id, release_number, rtype, doc_hash, per_query_top_n
+            query, nar_id, release_number, rtype, doc_id, per_query_top_n
         )
         for snippet in snippets:
             normalized = _normalize_match_text(snippet)
@@ -653,7 +766,7 @@ def retrieve_evidence_snippets(
     nar_id: str,
     release_number: str,
     rtype: str,
-    doc_hash: Optional[str],
+    doc_id: Optional[str],
     top_n: int,
 ) -> List[str]:
     """Retrieve evidence snippets using semantic search."""
@@ -667,9 +780,9 @@ def retrieve_evidence_snippets(
         "vec": vec,
         "topn": top_n,
     }
-    if doc_hash:
-        where.append("doc_hash=:doch")
-        params["doch"] = doc_hash
+    if doc_id:
+        where.append("doc_id=:doc_id")
+        params["doc_id"] = doc_id
     sql = text(f"""
         SELECT chunk
         FROM {TABLE_EVIDENCE}
@@ -713,7 +826,7 @@ def retrieve_mm_diagrams(
     nar_id: str,
     release_number: str,
     rtype: str,
-    doc_hash: Optional[str],
+    doc_id: Optional[str],
     top_n: int = 3,
     dim: int = MM_DIM,
 ) -> List[Dict[str, str]]:
@@ -728,9 +841,9 @@ def retrieve_mm_diagrams(
         "vec": vec,
         "topn": top_n,
     }
-    if doc_hash:
-        where.append("doc_hash=:doch")
-        params["doch"] = doc_hash
+    if doc_id:
+        where.append("doc_id=:doc_id")
+        params["doc_id"] = doc_id
     sql = text(f"""
         SELECT caption, doc_uri
         FROM {TABLE_MM_EVID}
@@ -872,10 +985,15 @@ def run_validation(
     release_number: str,
     rtype: str,
     top_k: int = 6,
+    scope_doc_id: Optional[str] = None,
     scope_doc_hash: Optional[str] = None,
     enable_mm: bool = True,
 ) -> Dict[str, Any]:
     """Run full validation workflow."""
+    effective_doc_id = (scope_doc_id or scope_doc_hash or "").strip() or None
+    if scope_doc_id and scope_doc_hash and scope_doc_id != scope_doc_hash:
+        raise ValueError("scope_doc_id and scope_doc_hash must match when both are provided.")
+
     if EMBED_DIM is None:
         logging.warning(
             f"Unknown embedding model '{EMBED_MODEL}'. "
@@ -912,7 +1030,7 @@ def run_validation(
             notes = (child.get("notes", "") or "").strip()
             conds = (child.get("conditions", "") or "").strip()
             kws = child.get("keywords") or []
-            kw_text = "".join(k.strip() for k in kws if isinstance(k, str) and k.strip())
+            kw_text = " ".join(k.strip() for k in kws if isinstance(k, str) and k.strip())
             
             # Topic-first retrieval queries
             topic_queries = build_topic_queries(intent_name, semantic_tag, tag, notes, conds, kw_text)
@@ -925,7 +1043,7 @@ def run_validation(
                 nar_id,
                 release_number,
                 rtype,
-                scope_doc_hash,
+                effective_doc_id,
                 top_k,
                 topic_search_phrases,
             )
@@ -953,45 +1071,43 @@ def run_validation(
                     nar_id,
                     release_number,
                     rtype,
-                    scope_doc_hash,
+                    effective_doc_id,
                     top_n=3,
                     dim=MM_DIM,
                 )
                 diag_block = "\n".join([f"{h['caption']}:: {h['doc_uri']}" for h in mm_hits]) or "(none)"
-                p_json = parse_json(
-                    gen_text(
-                        DIAGRAM_PROMPT.format(
-                            tag=tag,
-                            intent=intent_name,
-                            semantic_tag=semantic_tag,
-                            notes=notes,
-                            required_flag=(
-                                "MUST_HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-                            ),
-                            template_pdf_excerpts=pdf_join,
-                            guidance=g_join,
-                            evidence=s_join,
-                            diagrams=diag_block,
-                        )
-                    )
+                p_json, validation_error = generate_structured_json(
+                    DIAGRAM_PROMPT.format(
+                        tag=tag,
+                        intent=intent_name,
+                        semantic_tag=semantic_tag,
+                        notes=notes,
+                        required_flag=(
+                            "MUST_HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                        ),
+                        template_pdf_excerpts=pdf_join,
+                        guidance=g_join,
+                        evidence=s_join,
+                        diagrams=diag_block,
+                    ),
+                    response_kind=f"diagram validation for tag '{tag}'",
                 )
             else:
                 mm_hits = []
-                p_json = parse_json(
-                    gen_text(
-                        PRESENCE_QUALITY_PROMPT.format(
-                            tag=tag,
-                            intent=intent_name,
-                            semantic_tag=semantic_tag,
-                            notes=notes,
-                            required_flag=(
-                                "MUST_HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
-                            ),
-                            template_pdf_excerpts=pdf_join,
-                            guidance=g_join,
-                            evidence=s_join,
-                        )
-                    )
+                p_json, validation_error = generate_structured_json(
+                    PRESENCE_QUALITY_PROMPT.format(
+                        tag=tag,
+                        intent=intent_name,
+                        semantic_tag=semantic_tag,
+                        notes=notes,
+                        required_flag=(
+                            "MUST_HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
+                        ),
+                        template_pdf_excerpts=pdf_join,
+                        guidance=g_join,
+                        evidence=s_join,
+                    ),
+                    response_kind=f"presence validation for tag '{tag}'",
                 )
             
             status = ((p_json.get("status") if isinstance(p_json, dict) else None) or "MISSING").upper()
@@ -1051,12 +1167,13 @@ def run_validation(
                 "snippets": ev_snips[:top_k],
                 "used_guidance": bool(g_snips),
                 "template_pdf_used": bool(pdf_excerpts),
+                "validator_error": validation_error,
             })
     
     # Architecture summary (conceptual, logical, physical)
     arch_query = "overall Architecture Conceptual Logical Physical GKE Cloud SQL Interfaces components"
     arch_snips = retrieve_evidence_snippets(
-        arch_query, nar_id, release_number, rtype, scope_doc_hash, top_n=18
+        arch_query, nar_id, release_number, rtype, effective_doc_id, top_n=18
     )
     arch_s_join = "\n".join(arch_snips) if arch_snips else "(none)"
     arch_pdf = pick_best_template_snippets_for_tag(
@@ -1066,13 +1183,12 @@ def run_validation(
     )
     arch_pdf_join = "\n".join(arch_pdf) if arch_pdf else "(no template-pdf excerpt)"
     
-    arch_json = parse_json(
-        gen_text(
-            ARCHITECTURE_SUMMARY_PROMPT.format(
-                template_pdf_excerpts=arch_pdf_join,
-                evidence=arch_s_join,
-            )
-        )
+    arch_json, architecture_error = generate_structured_json(
+        ARCHITECTURE_SUMMARY_PROMPT.format(
+            template_pdf_excerpts=arch_pdf_join,
+            evidence=arch_s_join,
+        ),
+        response_kind="architecture summary",
     )
     
     logging.info(f"arch_json result: {arch_json}")
@@ -1082,7 +1198,8 @@ def run_validation(
         "application_name": application_name,
         "release_number": release_number,
         "rtype": rtype,
-        "doc_hash_scope": scope_doc_hash,
+        "doc_id_scope": effective_doc_id,
+        "doc_hash_scope": effective_doc_id,
         "must_have_total": must_total,
         "must_have_coverage_pct": round((must_met / must_total * 100.0), 1) if must_total else 0.0,
         "must_have_met": must_met,
@@ -1090,6 +1207,7 @@ def run_validation(
         "good_to_have_coverage_pct": round((good_met / good_total * 100.0), 1) if good_total else 0.0,
         "good_to_have_met": good_met,
         "architecture": arch_json,
+        "architecture_error": architecture_error,
     }
     
     return {"summary": summary, "per_intent": results}
@@ -1411,7 +1529,8 @@ def main():
     ap.add_argument("--release-number", required=True)
     ap.add_argument("--rtype", required=True, help="indev | new | migration | rehost | normal")
     ap.add_argument("--top-k", type=int, default=6, help="Top-K evidence text chunks per tag")
-    ap.add_argument("--scope-doc-hash", default="", help="Optional: restrict to a specific evidence doc_hash")
+    ap.add_argument("--scope-doc-id", default="", help="Optional: restrict validation to a specific evidence doc_id")
+    ap.add_argument("--scope-doc-hash", default="", help="Deprecated alias for --scope-doc-id")
     ap.add_argument("--enable-mm", action="store_true", help="Enable multimodal lane (diagram checks)")
     ap.add_argument("--out", default="validation_quality_result.json", help="Output JSON path")
     ap.add_argument("--pdf-out", default="summary_report.pdf", help="Output PDF path")
@@ -1423,13 +1542,17 @@ def main():
     
     # Fail fast on DB connection
     get_engine()
+    validate_runtime_contract(MM_DIM)
     
-    scope_doc_hash = args.scope_doc_hash.strip() or None
-    if scope_doc_hash:
-        logging.info(f"Using explicit doc hash scope: {scope_doc_hash}")
+    scope_doc_id = args.scope_doc_id.strip() or args.scope_doc_hash.strip() or None
+    if args.scope_doc_hash.strip() and not args.scope_doc_id.strip():
+        logging.warning("--scope-doc-hash is deprecated; use --scope-doc-id instead.")
+
+    if scope_doc_id:
+        logging.info(f"Using explicit doc_id scope: {scope_doc_id}")
     else:
         logging.info(
-            "No doc_hash scope provided; validating across matching evidence for the selected NAR/release/rtype."
+            "No doc_id scope provided; validating across matching evidence for the selected NAR/release/rtype."
         )
     
     result = run_validation(
@@ -1440,7 +1563,7 @@ def main():
         release_number=args.release_number,
         rtype=rtype,
         top_k=args.top_k,
-        scope_doc_hash=scope_doc_hash,
+        scope_doc_id=scope_doc_id,
         enable_mm=args.enable_mm,
     )
     
