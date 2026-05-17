@@ -1037,6 +1037,17 @@ def _normalize_multiline_text(text_in: str) -> str:
     return "\n".join(lines)
 
 
+def _section_identifier_present(section_id: str, text_in: str) -> bool:
+    """Return True when a section identifier such as 3.2.1 appears in raw text."""
+    if not _looks_like_section_identifier(section_id):
+        return False
+    pieces = re.findall(r"[A-Za-z]+|\d+", (section_id or "").strip())
+    if not pieces:
+        return False
+    pattern = r"(^|[^A-Za-z0-9])" + r"[\s.\-_/]*".join(re.escape(piece) for piece in pieces) + r"([^A-Za-z0-9]|$)"
+    return bool(re.search(pattern, text_in or "", flags=re.IGNORECASE))
+
+
 def _tokenize_match_text(text_in: str) -> List[str]:
     """Tokenize text for loose semantic overlap checks."""
     return re.findall(r"[a-z0-9]+", (text_in or "").lower())
@@ -1497,14 +1508,18 @@ def semantic_topic_match_strength(
     """Assess semantic match strength: 'exact', 'partial', or None."""
     if not evidence_snippets:
         return None
+    raw_joined = "\n".join(snippet for snippet in evidence_snippets if snippet)
     joined = _normalize_match_text(" ".join(evidence_snippets))
     if not joined:
         return None
     candidate_phrases = [semantic_tag] + [k for k in keywords if isinstance(k, str)]
+    for phrase in candidate_phrases:
+        if _section_identifier_present(phrase, raw_joined):
+            return "exact"
     normalized_phrases = []
     for phrase in candidate_phrases:
         normalized = _normalize_match_text(phrase)
-        if normalized and len(normalized) >= 4:
+        if normalized and (len(normalized) >= 4 or _looks_like_section_identifier(phrase)):
             normalized_phrases.append(normalized)
     if any(phrase in joined for phrase in normalized_phrases):
         return "exact"
