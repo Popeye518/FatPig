@@ -999,6 +999,17 @@ def extract_tag_prefix(tag: str) -> str:
     return match.group(1).strip().lower() if match else ""
 
 
+def _looks_like_section_identifier(text_in: str) -> bool:
+    """Return True when text looks like a bare section number such as 3.2.1."""
+    return bool(
+        re.fullmatch(
+            r"[A-Za-z]?\d+(?:[.,]\d+)*(?:\.[a-z])?",
+            (text_in or "").strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _normalize_match_text(text_in: str) -> str:
     """Normalize text for matching: lowercase, remove non-alphanumeric."""
     return re.sub(
@@ -1345,6 +1356,48 @@ def _build_topic_validation_fallback(
         "validator_error": validation_error,
     }
 
+
+def _default_validation_justification(
+    tag: str,
+    status: str,
+    evidence_snippets: List[str],
+    topic_match: Optional[str],
+    topic_alignment: Optional[str],
+    validation_error: Optional[str],
+) -> str:
+    """Generate a deterministic justification when the model returns a blank one."""
+    requirement_name = (tag or "this requirement").strip() or "this requirement"
+
+    if validation_error:
+        return (
+            f"Used deterministic justification for '{requirement_name}' because the model did not return valid structured output. "
+            f"Retrieved {len(evidence_snippets)} evidence snippet(s)."
+        )
+
+    if status == "PRESENT":
+        if topic_alignment == "aligned":
+            return f"Marked PRESENT for '{requirement_name}' because the expected topic was found under the matching section heading in the evidence."
+        if topic_alignment == "misaligned":
+            return f"Marked PRESENT for '{requirement_name}' because the required content was found in the evidence, even though the section numbering or label differs from the template."
+        if evidence_snippets:
+            return f"Marked PRESENT for '{requirement_name}' because supporting evidence snippets were retrieved and matched the expected topic with {topic_match or 'usable'} strength."
+        return f"Marked PRESENT for '{requirement_name}' based on validator output."
+
+    if status == "PARTIAL":
+        if evidence_snippets:
+            return f"Marked PARTIAL for '{requirement_name}' because some related evidence was retrieved, but it did not clearly satisfy the full requirement."
+        return f"Marked PARTIAL for '{requirement_name}' because the requirement appears only partially covered."
+
+    if status == "MISSING":
+        if evidence_snippets:
+            return f"Marked MISSING for '{requirement_name}' because retrieved evidence did not clearly satisfy the expected content for this requirement."
+        return f"Marked MISSING for '{requirement_name}' because no supporting evidence snippets were retrieved for this topic."
+
+    if status == "EMPTY":
+        return f"Marked EMPTY for '{requirement_name}' because the section appears present but contains no meaningful content to validate."
+
+    return f"Validation completed for '{requirement_name}' with status {status}."
+
 def topic_alignment_status(
     tag: str,
     semantic_tag: str,
@@ -1416,13 +1469,19 @@ def build_topic_search_phrases(
 ) -> List[str]:
     """Build search phrases for keyword-based retrieval."""
     requirement_phrases = requirement_phrases or []
-    candidates = [tag, semantic_tag] + [k for k in keywords if isinstance(k, str)] + requirement_phrases
+    tag_prefix = extract_tag_prefix(tag)
+    candidates = [tag, tag_prefix, semantic_tag] + [k for k in keywords if isinstance(k, str)] + requirement_phrases
     phrases: List[str] = []
     seen = set()
     for candidate in candidates:
         raw = (candidate or "").strip()
         normalized = _normalize_match_text(candidate)
-        if raw and normalized and len(normalized) > 4 and normalized not in seen:
+        if (
+            raw
+            and normalized
+            and (len(normalized) > 4 or _looks_like_section_identifier(raw))
+            and normalized not in seen
+        ):
             seen.add(normalized)
             phrases.append(raw)
     return phrases
@@ -1463,7 +1522,9 @@ def retrieve_keyword_evidence_snippets(
         exact_key = f"exact_{idx}"
         params[like_key] = f"%{raw_phrase}%"
         params[exact_key] = f"%{normalized_phrase}%"
-        phrase_conditions.append(f"chunk ILIKE :{like_key}")
+        phrase_conditions.append(
+            f"(chunk ILIKE :{like_key} OR lower(regexp_replace(chunk, '[^a-zA-Z0-9]', '', 'g')) LIKE :{exact_key})"
+        )
         exact_checks.append(
             f"CASE WHEN lower(regexp_replace(chunk, '[^a-zA-Z0-9]', '', 'g')) LIKE :{exact_key} THEN 0 ELSE 1 END"
         )
@@ -2274,6 +2335,17 @@ def run_validation(
             status = "PRESENT"
             justification = f"R-Type '{rtype}' was provided for validation."
             status_adjustment = status_adjustment or f"context_override:{raw_status}->{status}"
+
+        justification = (justification or "").strip()
+        if not justification:
+            justification = _default_validation_justification(
+                tag=tag,
+                status=status,
+                evidence_snippets=ev_snips,
+                topic_match=topic_match,
+                topic_alignment=topic_alignment,
+                validation_error=result_validation_error,
+            )
 
         results.append({
             "intent": intent_name,
