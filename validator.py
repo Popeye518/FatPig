@@ -14,6 +14,7 @@ import hashlib
 import base64
 import atexit
 import re
+from collections import Counter
 from datetime import datetime
 from typing import List, Dict, Any, Optional, Tuple
 from xml.sax.saxutils import escape as xml_escape
@@ -1031,6 +1032,87 @@ def _tokenize_match_text(text_in: str) -> List[str]:
     return re.findall(r"[a-z0-9]+", (text_in or "").lower())
 
 
+VALID_STATUSES = {"PRESENT", "PARTIAL", "MISSING", "EMPTY", "ERROR"}
+_EMPTY_VALUE_MARKERS = {
+    "",
+    "-",
+    "--",
+    "na",
+    "n/a",
+    "none",
+    "null",
+    "nil",
+    "tbd",
+    "unknown",
+    "empty",
+    "blank",
+    "missing",
+    "pending",
+    "not available",
+    "not applicable",
+}
+_EMPTY_TOKEN_MARKERS = {
+    "na",
+    "n",
+    "a",
+    "none",
+    "null",
+    "nil",
+    "tbd",
+    "unknown",
+    "empty",
+    "blank",
+    "missing",
+    "pending",
+    "not",
+    "applicable",
+    "available",
+}
+
+
+def _coerce_status(value: Any) -> Optional[str]:
+    """Normalize model status values to the supported set."""
+    normalized = str(value or "").strip().upper()
+    return normalized if normalized in VALID_STATUSES else None
+
+
+def _is_effectively_empty_text(value: Any) -> bool:
+    """Treat placeholder-like content as empty for conservative fallback classification."""
+    normalized = re.sub(r"\s+", " ", str(value or "")).strip().lower()
+    if not normalized:
+        return True
+
+    if normalized in _EMPTY_VALUE_MARKERS:
+        return True
+
+    collapsed = re.sub(r"[^a-z0-9]+", "", normalized)
+    if collapsed in {"na", "none", "null", "nil", "tbd", "unknown", "empty", "blank", "missing", "pending", "notavailable", "notapplicable"}:
+        return True
+
+    tokens = _tokenize_match_text(normalized)
+    if not tokens:
+        return True
+
+    return len(tokens) <= 8 and all(token in _EMPTY_TOKEN_MARKERS for token in tokens)
+
+
+def _has_meaningful_text(snippets: List[str]) -> bool:
+    """Return True when at least one snippet has usable content."""
+    return any(not _is_effectively_empty_text(snippet) for snippet in snippets)
+
+
+def _has_meaningful_diagram_refs(diagram_refs: Optional[List[Dict[str, str]]]) -> bool:
+    """Return True when at least one diagram reference contains usable content."""
+    for ref in diagram_refs or []:
+        if not isinstance(ref, dict):
+            continue
+        caption = ref.get("caption", "")
+        doc_uri = ref.get("doc_uri", "")
+        if not _is_effectively_empty_text(caption) or not _is_effectively_empty_text(doc_uri):
+            return True
+    return False
+
+
 def _load_template_nodes(template_json_path: str) -> List[Dict[str, Any]]:
     """Load template nodes from either a top-level list or an object with children."""
     with open(template_json_path, "r", encoding="utf-8") as f:
@@ -1175,26 +1257,31 @@ def _build_topic_validation_fallback(
         semantic_tag, keywords, evidence_snippets
     )
     evidence_present = bool(evidence_snippets)
+    meaningful_evidence = _has_meaningful_text(evidence_snippets)
     diagram_present = bool(diagram_refs)
+    meaningful_diagrams = _has_meaningful_diagram_refs(diagram_refs)
 
     if is_diagram:
-        if diagram_present or topic_match in ("exact", "partial"):
+        if meaningful_diagrams or topic_match == "exact":
             status = "PRESENT"
-        elif evidence_present:
+        elif evidence_present and meaningful_evidence:
             status = "PARTIAL"
+        elif evidence_present or diagram_present:
+            status = "EMPTY"
         else:
             status = "MISSING"
 
         quality = {
-            "completeness": 4 if diagram_present else (3 if evidence_present else 0),
-            "specificity": 4 if diagram_present else (2 if evidence_present else 0),
-            "diagram_alignment": 4 if diagram_present else (2 if evidence_present else 0),
+            "completeness": 4 if meaningful_diagrams else (3 if meaningful_evidence else (1 if evidence_present or diagram_present else 0)),
+            "specificity": 4 if meaningful_diagrams else (2 if meaningful_evidence else 0),
+            "diagram_alignment": 4 if meaningful_diagrams else (2 if meaningful_evidence else 0),
         }
 
         justification = (
             f"Used deterministic fallback for '{tag}' because the model returned "
-            f"unusable output. Diagram references found: {len(diagram_refs)}; "
-            f"evidence snippets found: {len(evidence_snippets)}."
+            f"unusable output. Diagram references found: {len(diagram_refs)} "
+            f"(meaningful={meaningful_diagrams}); evidence snippets found: {len(evidence_snippets)} "
+            f"(meaningful={meaningful_evidence})."
         )
 
         citations = {
@@ -1212,23 +1299,27 @@ def _build_topic_validation_fallback(
             ],
         }
     else:
-        if topic_match in ("exact", "partial"):
+        if topic_match == "exact":
             status = "PRESENT"
-        elif evidence_present:
+        elif topic_match == "partial" and meaningful_evidence:
             status = "PARTIAL"
+        elif evidence_present and meaningful_evidence:
+            status = "PARTIAL"
+        elif evidence_present:
+            status = "EMPTY"
         else:
             status = "MISSING"
 
         quality = {
-            "completeness": 4 if topic_match == "exact" else (3 if evidence_present else 0),
-            "specificity": 4 if topic_match == "exact" else (2 if evidence_present else 0),
-            "traceability": 3 if evidence_present else 0,
+            "completeness": 4 if topic_match == "exact" else (3 if meaningful_evidence else (1 if evidence_present else 0)),
+            "specificity": 4 if topic_match == "exact" else (2 if meaningful_evidence else 0),
+            "traceability": 3 if meaningful_evidence else 0,
         }
 
         justification = (
             f"Used deterministic fallback for '{tag}' because the model returned "
-            f"unusable output. Evidence snippets found: {len(evidence_snippets)}; "
-            f"semantic match={topic_match or 'none'}."
+            f"unusable output. Evidence snippets found: {len(evidence_snippets)} "
+            f"(meaningful={meaningful_evidence}); semantic match={topic_match or 'none'}."
         )
 
         citations = {
@@ -2110,13 +2201,16 @@ def run_validation(
                     validation_error=validation_error,
                 )
 
-        status = (
-            (p_json.get("status") if isinstance(p_json, dict) else None) or "MISSING"
-        ).upper()
+        raw_status = _coerce_status(
+            p_json.get("status") if isinstance(p_json, dict) else None
+        ) or "MISSING"
+        status = raw_status
         justification = p_json.get("justification", "") if isinstance(p_json, dict) else ""
         result_quality = p_json.get("quality", {}) if isinstance(p_json, dict) else {}
         result_citations = p_json.get("citations", {}) if isinstance(p_json, dict) else {}
         result_validation_error = validation_error
+        status_source = "fallback" if validation_error else "model"
+        status_adjustment = ""
 
         tag_1 = (tag or "").strip().lower()
         topic_match = semantic_topic_match_strength(
@@ -2132,30 +2226,39 @@ def run_validation(
             evidence_snippets=ev_snips,
         )
 
-        if promote_semantic_match and status in ("MISSING", "PARTIAL", "ERROR"):
-            status = "PRESENT"
-            if topic_alignment == "aligned":
-                topic_note = (
-                    f"Topic '{semantic_tag}' was found in the evidence and is well-aligned with the expected template tag '{tag}'. "
-                    "Marked PRESENT based on strong semantic match and alignment, despite any numbering or labeling differences."
-                )
-            elif topic_alignment == "misaligned":
-                topic_note = (
-                    f"Topic '{semantic_tag}' appears in the evidence, but not under the expected template tag '{tag}'. "
-                    "Marked PRESENT because the content is present but the section/tag alignment does not match the template."
-                )
+        if promote_semantic_match and status in ("MISSING", "ERROR"):
+            if topic_match == "exact":
+                status = "PRESENT"
+                if topic_alignment == "aligned":
+                    topic_note = (
+                        f"Topic '{semantic_tag}' was found in the evidence and is well-aligned with the expected template tag '{tag}'. "
+                        "Marked PRESENT based on strong semantic match and alignment, despite any numbering or labeling differences."
+                    )
+                elif topic_alignment == "misaligned":
+                    topic_note = (
+                        f"Topic '{semantic_tag}' appears in the evidence, but not under the expected template tag '{tag}'. "
+                        "Marked PRESENT because the content is present but the section/tag alignment does not match the template."
+                    )
+                else:
+                    topic_note = (
+                        f"Topic '{semantic_tag}' was identified in the evidence with a strong semantic match. "
+                        "Marked PRESENT based on the presence of relevant content, even though the original classification was too conservative."
+                    )
             else:
+                status = "PARTIAL"
                 topic_note = (
                     f"Topic '{semantic_tag}' was identified in the evidence with a partial semantic match. "
-                    "Marked PRESENT based on the presence of relevant content, even though it may not fully meet all criteria or be perfectly aligned."
+                    "Marked PARTIAL instead of MISSING because related content exists, but the evidence is not strong enough to treat it as fully present."
                 )
             justification = topic_note
+            status_adjustment = f"semantic_promotion:{raw_status}->{status}"
             if not isinstance(result_citations, dict):
                 result_citations = {}
 
         if tag_1 in ("0.1 nar id", "8.1 nar id", "nar id") and nar_id:
             status = "PRESENT"
             justification = f"NAR ID '{nar_id}' was resolved from evidence."
+            status_adjustment = status_adjustment or f"context_override:{raw_status}->{status}"
 
         if tag_1 in (
             "0.2 app name",
@@ -2165,10 +2268,12 @@ def run_validation(
         ) and application_name:
             status = "PRESENT"
             justification = f"Application name '{application_name}' was resolved from evidence."
+            status_adjustment = status_adjustment or f"context_override:{raw_status}->{status}"
 
         if tag_1 in ("0.3 r-type", "0.3 r type", "r-type", "r type", "rtype") and rtype:
             status = "PRESENT"
             justification = f"R-Type '{rtype}' was provided for validation."
+            status_adjustment = status_adjustment or f"context_override:{raw_status}->{status}"
 
         results.append({
             "intent": intent_name,
@@ -2176,6 +2281,9 @@ def run_validation(
             "musthave": mreq,
             "good_to_have": greq,
             "status": status,
+            "raw_status": raw_status,
+            "status_source": status_source,
+            "status_adjustment": status_adjustment,
             "quality": result_quality,
             "justification": justification,
             "citations": result_citations,
@@ -2236,6 +2344,10 @@ def run_validation(
     must_met = sum(1 for item in results if item.get("musthave") and item.get("status") == "PRESENT")
     good_total = sum(1 for item in results if item.get("good_to_have"))
     good_met = sum(1 for item in results if item.get("good_to_have") and item.get("status") == "PRESENT")
+    status_counts = Counter(
+        str(item.get("status") or "MISSING").upper()
+        for item in results
+    )
 
     scope_label = _resolve_validation_scope_label(
         nar_id=nar_id,
@@ -2258,6 +2370,18 @@ def run_validation(
         "good_to_have_coverage_pct": round((good_met / good_total * 100.0), 1) if good_total else 0.0,
         "fallback_topic_count": sum(1 for item in results if item.get("fallback_used")),
         "topics_with_validator_warnings": sum(1 for item in results if item.get("validator_error")),
+        "status_counts": {
+            "PRESENT": status_counts.get("PRESENT", 0),
+            "PARTIAL": status_counts.get("PARTIAL", 0),
+            "MISSING": status_counts.get("MISSING", 0),
+            "EMPTY": status_counts.get("EMPTY", 0),
+            "ERROR": status_counts.get("ERROR", 0),
+        },
+        "present_count": status_counts.get("PRESENT", 0),
+        "partial_count": status_counts.get("PARTIAL", 0),
+        "missing_count": status_counts.get("MISSING", 0),
+        "empty_count": status_counts.get("EMPTY", 0),
+        "error_count": status_counts.get("ERROR", 0),
         "architecture_evidence_snippet_count": len(arch_snips),
         "architecture_diagram_ref_count": len(arch_mm_hits),
         "architecture_template_excerpt_count": len(arch_pdf),
@@ -2316,6 +2440,12 @@ def generate_summary_pdf(
         good_to_have_met = summary.get("good_to_have_met", 0)
         good_to_have_diff = good_to_have_total - good_to_have_met
         good_to_have_coverage = summary.get("good_to_have_coverage_pct", 0.0)
+        status_counts = summary.get("status_counts") or {}
+        present_count = int(status_counts.get("PRESENT", 0) or 0)
+        partial_count = int(status_counts.get("PARTIAL", 0) or 0)
+        missing_count = int(status_counts.get("MISSING", 0) or 0)
+        empty_count = int(status_counts.get("EMPTY", 0) or 0)
+        error_count = int(status_counts.get("ERROR", 0) or 0)
 
         architecture_summary = architecture.get("summary", "")
         if not architecture_summary:
@@ -2437,6 +2567,42 @@ def generate_summary_pdf(
         )
         story.append(Paragraph(f"Reason: {reason_text}", result_line_style))
         story.append(Spacer(1, 10))
+
+        story.append(section_heading("Status Breakdown"))
+        story.append(Spacer(1, 8))
+
+        status_metrics_data = [
+            [
+                Paragraph("<b>Present</b>", small_style),
+                Paragraph("<b>Partial</b>", small_style),
+                Paragraph("<b>Missing</b>", small_style),
+                Paragraph("<b>Empty</b>", small_style),
+                Paragraph("<b>Error</b>", small_style),
+            ],
+            [
+                Paragraph(str(present_count), small_style),
+                Paragraph(str(partial_count), small_style),
+                Paragraph(str(missing_count), small_style),
+                Paragraph(str(empty_count), small_style),
+                Paragraph(str(error_count), small_style),
+            ],
+        ]
+        status_metrics_table = Table(status_metrics_data, colWidths=[70, 70, 70, 70, 70])
+        status_metrics_table.setStyle(TableStyle([
+            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#d9eaf7")),
+            ("TEXTCOLOR", (0, 0), (-1, 0), colors.black),
+            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+            ("BACKGROUND", (0, 1), (-1, 1), colors.HexColor("#f9f9f9")),
+            ("GRID", (0, 0), (-1, -1), 0.75, colors.grey),
+            ("VALIGN", (0, 0), (-1, -1), "MIDDLE"),
+            ("ALIGN", (0, 0), (-1, -1), "LEFT"),
+            ("LEFTPADDING", (0, 0), (-1, -1), 8),
+            ("RIGHTPADDING", (0, 0), (-1, -1), 8),
+            ("TOPPADDING", (0, 0), (-1, -1), 8),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 8),
+        ]))
+        story.append(status_metrics_table)
+        story.append(Spacer(1, 12))
 
         story.append(section_heading("Must-Have Requirements"))
         story.append(Spacer(1, 8))
