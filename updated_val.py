@@ -571,7 +571,7 @@ def gen_text(prompt: str) -> str:
     try:
         json_generation_config = genai_types.GenerateContentConfig(
             temperature=0.0,
-            max_output_tokens=8192,
+            max_output_tokens=2192,
             response_mime_type="application/json",
         )
         generated_text, resp = _generate_with_config(
@@ -587,7 +587,7 @@ def gen_text(prompt: str) -> str:
             )
             text_generation_config = genai_types.GenerateContentConfig(
                 temperature=0.0,
-                max_output_tokens=8192,
+                max_output_tokens=2192,
             )
             generated_text, fallback_resp = _generate_with_config(
                 prompt,
@@ -998,6 +998,17 @@ def extract_tag_prefix(tag: str) -> str:
     return match.group(1).strip().lower() if match else ""
 
 
+def _looks_like_section_identifier(text_in: str) -> bool:
+    """Return True when text looks like a bare section number such as 3.2.1."""
+    return bool(
+        re.fullmatch(
+            r"[A-Za-z]?\d+(?:[.,]\d+)*(?:\.[a-z])?",
+            (text_in or "").strip(),
+            flags=re.IGNORECASE,
+        )
+    )
+
+
 def _normalize_match_text(text_in: str) -> str:
     """Normalize text for matching: lowercase, remove non-alphanumeric."""
     return re.sub(
@@ -1005,59 +1016,6 @@ def _normalize_match_text(text_in: str) -> str:
         "",
         re.sub(r"[^a-z0-9]+", "", (text_in or "").lower()),
     ).strip()
-
-
-def expand_topic_aliases(
-    tag: str,
-    semantic_tag: str,
-    keywords: List[str],
-    notes: str = "",
-    conds: str = "",
-) -> List[str]:
-    """Add narrow aliases for topics that often vary across evidence sets."""
-    semantic_norm = _normalize_match_text(semantic_tag or tag)
-    existing_norms = {
-        _normalize_match_text(value)
-        for value in [tag, semantic_tag, notes, conds, *[k for k in keywords if isinstance(k, str)]]
-        if (value or "").strip()
-    }
-
-    alias_candidates: List[str] = []
-    if semantic_norm == "logicaldatamodel":
-        alias_candidates = [
-            "logical model",
-            "entity relationship diagram",
-            "entity relationships",
-            "domain decomposition",
-        ]
-    elif semantic_norm == "physicaldatamodel":
-        alias_candidates = [
-            "physical model",
-            "physical schema",
-            "schema design",
-            "partitioning clustering",
-        ]
-    elif semantic_norm == "ingressvolume":
-        alias_candidates = [
-            "inbound volume",
-            "incoming traffic volume",
-            "network ingress",
-        ]
-    elif semantic_norm == "egressvolume":
-        alias_candidates = [
-            "outbound volume",
-            "outgoing traffic volume",
-            "network egress",
-        ]
-
-    aliases: List[str] = []
-    seen = set()
-    for candidate in alias_candidates:
-        normalized = _normalize_match_text(candidate)
-        if normalized and normalized not in existing_norms and normalized not in seen:
-            seen.add(normalized)
-            aliases.append(candidate)
-    return aliases
 
 
 def _normalize_line_text(text_in: str) -> str:
@@ -1082,19 +1040,6 @@ def _normalize_multiline_text(text_in: str) -> str:
 def _tokenize_match_text(text_in: str) -> List[str]:
     """Tokenize text for loose semantic overlap checks."""
     return re.findall(r"[a-z0-9]+", (text_in or "").lower())
-
-
-MATCH_STOP_WORDS = {
-    "and", "the", "for", "with", "from", "into", "that", "this",
-    "have", "must", "good", "include", "includes", "table", "section",
-    "application", "overview", "details", "link", "keep", "applicable",
-    "diagram",
-}
-
-TABLE_PLACEHOLDER_TOKENS = {
-    "na", "n", "none", "nil", "null", "tbd", "tbc", "pending",
-    "unknown", "blank", "empty", "todo", "later", "nill",
-}
 
 
 def _load_template_nodes(template_json_path: str) -> List[Dict[str, Any]]:
@@ -1320,6 +1265,48 @@ def _build_topic_validation_fallback(
         "validator_error": validation_error,
     }
 
+
+def _default_validation_justification(
+    tag: str,
+    status: str,
+    evidence_snippets: List[str],
+    topic_match: Optional[str],
+    topic_alignment: Optional[str],
+    validation_error: Optional[str],
+) -> str:
+    """Generate a deterministic justification when the model returns a blank one."""
+    requirement_name = (tag or "this requirement").strip() or "this requirement"
+
+    if validation_error:
+        return (
+            f"Used deterministic justification for '{requirement_name}' because the model did not return valid structured output. "
+            f"Retrieved {len(evidence_snippets)} evidence snippet(s)."
+        )
+
+    if status == "PRESENT":
+        if topic_alignment == "aligned":
+            return f"Marked PRESENT for '{requirement_name}' because the expected topic was found under the matching section heading in the evidence."
+        if topic_alignment == "misaligned":
+            return f"Marked PRESENT for '{requirement_name}' because the required content was found in the evidence, even though the section numbering or label differs from the template."
+        if evidence_snippets:
+            return f"Marked PRESENT for '{requirement_name}' because supporting evidence snippets were retrieved and matched the expected topic with {topic_match or 'usable'} strength."
+        return f"Marked PRESENT for '{requirement_name}' based on validator output."
+
+    if status == "PARTIAL":
+        if evidence_snippets:
+            return f"Marked PARTIAL for '{requirement_name}' because some related evidence was retrieved, but it did not clearly satisfy the full requirement."
+        return f"Marked PARTIAL for '{requirement_name}' because the requirement appears only partially covered."
+
+    if status == "MISSING":
+        if evidence_snippets:
+            return f"Marked MISSING for '{requirement_name}' because retrieved evidence did not clearly satisfy the expected content for this requirement."
+        return f"Marked MISSING for '{requirement_name}' because no supporting evidence snippets were retrieved for this topic."
+
+    if status == "EMPTY":
+        return f"Marked EMPTY for '{requirement_name}' because the section appears present but contains no meaningful content to validate."
+
+    return f"Validation completed for '{requirement_name}' with status {status}."
+
 def topic_alignment_status(
     tag: str,
     semantic_tag: str,
@@ -1391,27 +1378,33 @@ def build_topic_search_phrases(
 ) -> List[str]:
     """Build search phrases for keyword-based retrieval."""
     requirement_phrases = requirement_phrases or []
-    candidates = [tag, semantic_tag] + [k for k in keywords if isinstance(k, str)] + requirement_phrases
+    tag_prefix = extract_tag_prefix(tag)
+    candidates = [tag, tag_prefix, semantic_tag] + [k for k in keywords if isinstance(k, str)] + requirement_phrases
     phrases: List[str] = []
     seen = set()
     for candidate in candidates:
         raw = (candidate or "").strip()
         normalized = _normalize_match_text(candidate)
-        if raw and normalized and len(normalized) > 4 and normalized not in seen:
+        if (
+            raw
+            and normalized
+            and (len(normalized) > 4 or _looks_like_section_identifier(raw))
+            and normalized not in seen
+        ):
             seen.add(normalized)
             phrases.append(raw)
     return phrases
 
 
-def retrieve_keyword_evidence_records(
+def retrieve_keyword_evidence_snippets(
     phrases: List[str],
     nar_id: str,
     release_number: str,
     rtype: str,
     doc_id: Optional[str],
     top_n: int,
-) -> List[Dict[str, str]]:
-    """Retrieve evidence snippets with doc_id metadata using keyword matching."""
+) -> List[str]:
+    """Retrieve evidence snippets using keyword matching."""
     valid_phrases = []
     seen = set()
     for phrase in phrases:
@@ -1438,12 +1431,14 @@ def retrieve_keyword_evidence_records(
         exact_key = f"exact_{idx}"
         params[like_key] = f"%{raw_phrase}%"
         params[exact_key] = f"%{normalized_phrase}%"
-        phrase_conditions.append(f"chunk ILIKE :{like_key}")
+        phrase_conditions.append(
+            f"(chunk ILIKE :{like_key} OR lower(regexp_replace(chunk, '[^a-zA-Z0-9]', '', 'g')) LIKE :{exact_key})"
+        )
         exact_checks.append(
             f"CASE WHEN lower(regexp_replace(chunk, '[^a-zA-Z0-9]', '', 'g')) LIKE :{exact_key} THEN 0 ELSE 1 END"
         )
     sql = text(f"""
-        SELECT doc_id, chunk
+        SELECT chunk
         FROM {TABLE_EVIDENCE}
         WHERE {" AND ".join(where)}
           AND ({" OR ".join(phrase_conditions)})
@@ -1453,73 +1448,7 @@ def retrieve_keyword_evidence_records(
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(sql, params).fetchall()
-    return [
-        {"doc_id": str(r[0] or ""), "snippet": r[1]}
-        for r in rows
-        if r and (r[1] or "").strip()
-    ]
-
-
-def retrieve_keyword_evidence_snippets(
-    phrases: List[str],
-    nar_id: str,
-    release_number: str,
-    rtype: str,
-    doc_id: Optional[str],
-    top_n: int,
-) -> List[str]:
-    """Retrieve evidence snippets using keyword matching."""
-    return [
-        record["snippet"]
-        for record in retrieve_keyword_evidence_records(
-            phrases,
-            nar_id,
-            release_number,
-            rtype,
-            doc_id,
-            top_n,
-        )
-    ]
-
-
-def retrieve_topic_evidence_records(
-    queries: List[str],
-    nar_id: str,
-    release_number: str,
-    rtype: str,
-    doc_id: Optional[str],
-    top_n: int,
-    search_phrases: Optional[List[str]] = None,
-) -> List[Dict[str, str]]:
-    """Retrieve evidence snippets with doc_id metadata using semantic + keyword search."""
-    merged: List[Dict[str, str]] = []
-    per_query_top_n = max(3, min(top_n, 4))
-    seen = set()
-    if search_phrases:
-        lexical_hits = retrieve_keyword_evidence_records(
-            search_phrases, nar_id, release_number, rtype, doc_id, top_n
-        )
-        for hit in lexical_hits:
-            snippet = hit.get("snippet", "")
-            normalized = _normalize_match_text(snippet)
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                merged.append(hit)
-        if len(merged) >= top_n:
-            return merged
-    for query in queries:
-        snippets = retrieve_evidence_records(
-            query, nar_id, release_number, rtype, doc_id, per_query_top_n
-        )
-        for hit in snippets:
-            snippet = hit.get("snippet", "")
-            normalized = _normalize_match_text(snippet)
-            if normalized and normalized not in seen:
-                seen.add(normalized)
-                merged.append(hit)
-        if len(merged) >= top_n:
-            return merged
-    return merged
+    return [r[0] for r in rows if r and (r[0] or "").strip()]
 
 
 def retrieve_topic_evidence_snippets(
@@ -1532,18 +1461,32 @@ def retrieve_topic_evidence_snippets(
     search_phrases: Optional[List[str]] = None,
 ) -> List[str]:
     """Retrieve evidence snippets using semantic + keyword search."""
-    return [
-        record["snippet"]
-        for record in retrieve_topic_evidence_records(
-            queries,
-            nar_id,
-            release_number,
-            rtype,
-            doc_id,
-            top_n,
-            search_phrases,
+    merged: List[str] = []
+    per_query_top_n = max(3, min(top_n, 4))
+    seen = set()
+    if search_phrases:
+        lexical_hits = retrieve_keyword_evidence_snippets(
+            search_phrases, nar_id, release_number, rtype, doc_id, top_n
         )
-    ]
+        for snippet in lexical_hits:
+            normalized = _normalize_match_text(snippet)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                merged.append(snippet)
+        if len(merged) >= top_n:
+            return merged
+    for query in queries:
+        snippets = retrieve_evidence_snippets(
+            query, nar_id, release_number, rtype, doc_id, per_query_top_n
+        )
+        for snippet in snippets:
+            normalized = _normalize_match_text(snippet)
+            if normalized and normalized not in seen:
+                seen.add(normalized)
+                merged.append(snippet)
+        if len(merged) >= top_n:
+            return merged
+    return merged
 
 
 def semantic_topic_match_strength(
@@ -1565,11 +1508,16 @@ def semantic_topic_match_strength(
             normalized_phrases.append(normalized)
     if any(phrase in joined for phrase in normalized_phrases):
         return "exact"
+    stop_words = {
+        "and", "the", "for", "with", "from", "into", "that", "this",
+        "have", "must", "good", "include", "table", "section", "application",
+        "overview", "details", "link", "keep", "applicable",
+    }
     evidence_token_set = set(_tokenize_match_text(" ".join(evidence_snippets)))
     semantic_tokens : List[str] = []
     for phrase in [semantic_tag] + [k for k in keywords if isinstance(k, str)]:
         for token in _tokenize_match_text(phrase):
-            if len(token) > 4 and token not in MATCH_STOP_WORDS and token not in semantic_tokens:
+            if len(token) > 4 and token not in stop_words and token not in semantic_tokens:
                 semantic_tokens.append(token)
     if not semantic_tokens:
         return None
@@ -1594,8 +1542,15 @@ def extract_requirement_phrases(notes: str, conds: str) -> List[str]:
         seen.add(normalized)
         phrases.append(raw)
 
-    for item in extract_structured_requirement_items(notes, conds):
-        add_phrase(item)
+    include_match = re.search(
+        r"include\s*:\s*(.+?)(?:\.|$)",
+        notes or "",
+        flags=re.IGNORECASE,
+    )
+    if include_match:
+        include_block = include_match.group(1)
+        for part in re.split(r",|;|\band\b", include_block, flags=re.IGNORECASE):
+            add_phrase(part)
 
     for text_block in [notes, conds]:
         for part in re.split(r"[.;]\s+", text_block or ""):
@@ -1603,225 +1558,6 @@ def extract_requirement_phrases(notes: str, conds: str) -> List[str]:
                 add_phrase(part)
 
     return phrases[:6]
-
-
-def extract_structured_requirement_items(notes: str, conds: str) -> List[str]:
-    """Extract explicit required items such as table columns or diagram checklist items."""
-    items: List[str] = []
-    seen = set()
-
-    def add_item(value: str) -> None:
-        raw = (value or "").strip(" .;:-")
-        normalized = _normalize_match_text(raw)
-        if not raw or len(normalized) < 4 or normalized in seen:
-            return
-        seen.add(normalized)
-        items.append(raw)
-
-    patterns = [
-        r"\bincludes?\s*:?\s*(.+?)(?:\.|$)",
-        r"\bprovide\s*:?\s*(.+?)(?:\.|$)",
-        r"\blist\s*:?\s*(.+?)(?:\.|$)",
-    ]
-    for text_block in [notes, conds]:
-        for pattern in patterns:
-            for match in re.finditer(pattern, text_block or "", flags=re.IGNORECASE):
-                block = match.group(1)
-                for part in re.split(r",|;|/|\||\band\b", block, flags=re.IGNORECASE):
-                    add_item(part)
-
-    return items[:8]
-
-
-def _requirement_item_matches(
-    item: str,
-    normalized_joined: str,
-    token_set: set,
-) -> bool:
-    """Check whether a required item is clearly evidenced in retrieved text."""
-    normalized_item = _normalize_match_text(item)
-    if normalized_item and normalized_item in normalized_joined:
-        return True
-
-    item_tokens = [
-        token
-        for token in _tokenize_match_text(item)
-        if len(token) > 3 and token not in MATCH_STOP_WORDS
-    ]
-    if not item_tokens:
-        return False
-
-    token_hits = sum(1 for token in item_tokens if token in token_set)
-    if len(item_tokens) == 1:
-        return token_hits == 1
-    required_hits = len(item_tokens) if len(item_tokens) <= 2 else len(item_tokens) - 1
-    return token_hits >= required_hits
-
-
-def assess_requirement_item_coverage(
-    required_items: List[str],
-    text_blocks: List[str],
-) -> Dict[str, Any]:
-    """Measure coverage of explicit required items against retrieved evidence."""
-    joined_text = "\n".join(block for block in text_blocks if (block or "").strip())
-    normalized_joined = _normalize_match_text(joined_text)
-    token_set = set(_tokenize_match_text(joined_text))
-    matched_items: List[str] = []
-    missing_items: List[str] = []
-
-    for item in required_items:
-        if _requirement_item_matches(item, normalized_joined, token_set):
-            matched_items.append(item)
-        else:
-            missing_items.append(item)
-
-    total_count = len(required_items)
-    matched_count = len(matched_items)
-    return {
-        "matched_items": matched_items,
-        "missing_items": missing_items,
-        "matched_count": matched_count,
-        "total_count": total_count,
-        "coverage_ratio": round((matched_count / total_count), 3) if total_count else 1.0,
-    }
-
-
-def requirement_items_ready_for_present(coverage: Dict[str, Any]) -> bool:
-    """Require strong coverage for explicit row/column style requirements before PRESENT."""
-    total_count = int(coverage.get("total_count") or 0)
-    matched_count = int(coverage.get("matched_count") or 0)
-    if total_count <= 0:
-        return True
-    if total_count <= 3:
-        return matched_count == total_count
-    return matched_count >= total_count - 1
-
-
-def requirement_items_partially_covered(coverage: Dict[str, Any]) -> bool:
-    """Detect whether at least some explicit structured items were evidenced."""
-    return int(coverage.get("matched_count") or 0) > 0
-
-
-def is_table_like_requirement(
-    tag: str,
-    notes: str,
-    conds: str,
-    source: str,
-    required_items: List[str],
-) -> bool:
-    """Detect requirements that should behave like structured tables/checklists."""
-    haystack = " ".join([tag or "", notes or "", conds or "", source or ""]).lower()
-    if "diagram" in haystack:
-        return False
-    return (
-        "table" in haystack
-        or ("row" in haystack and "column" in haystack)
-        or (source == "verification-table" and len(required_items) >= 2)
-    )
-
-
-def _looks_like_tabular_line(raw_line: str) -> bool:
-    """Detect lines that look like extracted table rows (strong version)."""
-    if not raw_line:
-        return False
-
-    line = raw_line.strip()
-
-    # clear separators
-    if "|" in line or "\t" in line:
-        return True
-
-    # multiple spaces (PDF column split)
-    if len(re.findall(r"\s{2,}", line)) >= 2:
-        return True
-
-    # comma-separated short row
-    if line.count(",") >= 2 and len(line) < 200:
-        return True
-
-    # numeric-heavy structured rows
-    tokens = line.split()
-    numeric_tokens = sum(1 for t in tokens if any(c.isdigit() for c in t))
-    if len(tokens) >= 3 and numeric_tokens >= 1:
-        return True
-
-    return False
-
-def is_table_chunk(chunk: str) -> bool:
-    """Detect if a chunk contains table-like structure."""
-    if not chunk:
-        return False
-
-    lines = chunk.split("\n")
-
-    table_lines = sum(1 for l in lines if _looks_like_tabular_line(l))
-
-    # if multiple lines look structured → table
-    return table_lines >= 2
-
-def _is_placeholder_token(token: str) -> bool:
-    """Treat common filler values as non-substantive table content."""
-    normalized = (token or "").strip().lower()
-    if not normalized:
-        return True
-    if normalized in TABLE_PLACEHOLDER_TOKENS:
-        return True
-    if normalized in {"-", "--", "---", "_", "__", "___"}:
-        return True
-    return False
-
-
-def is_diagram_requirement(
-    tag: str,
-    notes: str,
-    conds: str,
-    keywords: List[str],
-) -> bool:
-    """Detect topics that should use the diagram lane, including data-model diagrams."""
-    haystack = " ".join(
-        [tag or "", notes or "", conds or "", *[k for k in keywords if isinstance(k, str)]]
-    ).lower()
-    return any(
-        marker in haystack
-        for marker in (
-            "diagram",
-            "logical data model",
-            "physical data model",
-            "entity relationship",
-            "entity relationships",
-            "domain decomposition",
-            "erd",
-            "data model",
-        )
-    )
-
-
-def build_diagram_reference_texts(diagram_refs: List[Dict[str, str]]) -> List[str]:
-    """Flatten diagram refs into searchable text."""
-    texts: List[str] = []
-    for ref in diagram_refs:
-        text_value = " ".join(
-            part.strip()
-            for part in [ref.get("caption", ""), ref.get("doc_uri", "")]
-            if (part or "").strip()
-        ).strip()
-        if text_value:
-            texts.append(text_value)
-    return texts
-
-
-def filter_relevant_diagram_refs(
-    semantic_tag: str,
-    keywords: List[str],
-    diagram_refs: List[Dict[str, str]],
-) -> List[Dict[str, str]]:
-    """Prefer diagram refs whose caption or URI aligns with the requested diagram type."""
-    aligned_refs: List[Dict[str, str]] = []
-    for ref in diagram_refs:
-        ref_texts = build_diagram_reference_texts([ref])
-        if semantic_topic_match_strength(semantic_tag, keywords, ref_texts) in ("exact", "partial"):
-            aligned_refs.append(ref)
-    return aligned_refs or diagram_refs
 
 
 def should_promote_semantic_match(
@@ -1860,190 +1596,6 @@ def should_promote_semantic_match(
 
     return strong_keyword_hits >= 2
 
-
-def build_per_document_observations(
-    candidate_doc_ids: List[str],
-    tag: str,
-    semantic_tag: str,
-    keywords: List[str],
-    structured_items: List[str],
-    enforce_structured_items: bool,
-    is_diagram: bool,
-    enable_mm: bool,
-    evidence_records: List[Dict[str, str]],
-    diagram_refs: List[Dict[str, str]],
-) -> List[Dict[str, Any]]:
-    """Summarize row coverage per evidence document for mixed-scope validations."""
-    grouped: Dict[str, Dict[str, Any]] = {}
-
-    def ensure_group(doc_value: str) -> Dict[str, Any]:
-        doc_key = (doc_value or "").strip() or "UNKNOWN_DOC"
-        group = grouped.get(doc_key)
-        if group is None:
-            group = {
-                "doc_id": doc_key,
-                "snippets": [],
-                "diagram_refs": [],
-                "_snippet_seen": set(),
-                "_diagram_seen": set(),
-            }
-            grouped[doc_key] = group
-        return group
-
-    for doc_value in candidate_doc_ids:
-        ensure_group(doc_value)
-
-    for record in evidence_records:
-        snippet = (record.get("snippet") or "").strip()
-        if not snippet:
-            continue
-        group = ensure_group(record.get("doc_id", ""))
-        normalized_snippet = _normalize_match_text(snippet)
-        if normalized_snippet and normalized_snippet not in group["_snippet_seen"]:
-            group["_snippet_seen"].add(normalized_snippet)
-            group["snippets"].append(snippet)
-
-    for ref in diagram_refs:
-        group = ensure_group(ref.get("doc_id", ""))
-        ref_key = _normalize_match_text(
-            " ".join([ref.get("caption", ""), ref.get("doc_uri", "")])
-        )
-        if ref_key and ref_key not in group["_diagram_seen"]:
-            group["_diagram_seen"].add(ref_key)
-            group["diagram_refs"].append(ref)
-
-    observations: List[Dict[str, Any]] = []
-    for doc_key in sorted(grouped):
-        group = grouped[doc_key]
-        doc_snips = group["snippets"]
-        doc_diagram_refs = group["diagram_refs"]
-        doc_diagram_texts = build_diagram_reference_texts(doc_diagram_refs)
-        doc_topic_match = semantic_topic_match_strength(semantic_tag, keywords, doc_snips)
-        doc_topic_alignment = topic_alignment_status(tag, semantic_tag, doc_snips)
-        doc_structured_coverage = assess_requirement_item_coverage(
-            structured_items,
-            doc_snips + (doc_diagram_texts if is_diagram else []),
-        )
-        doc_structured_ready = (
-            not enforce_structured_items
-            or requirement_items_ready_for_present(doc_structured_coverage)
-        )
-        doc_diagram_ref_alignment = (
-            semantic_topic_match_strength(semantic_tag, keywords, doc_diagram_texts)
-            if is_diagram and doc_diagram_refs
-            else None
-        )
-        doc_diagram_ready = (
-            doc_topic_match == "exact"
-            if is_diagram and not enable_mm
-            else (
-                not is_diagram
-                or (
-                    (
-                        bool(doc_diagram_refs)
-                        and (
-                            doc_diagram_ref_alignment in ("exact", "partial")
-                            or doc_topic_match == "exact"
-                            or doc_topic_alignment in ("aligned", "misaligned")
-                        )
-                    )
-                    or (
-                        not doc_diagram_refs
-                        and doc_topic_match == "exact"
-                        and doc_topic_alignment in ("aligned", "misaligned")
-                    )
-                )
-            )
-        )
-        doc_sparse_table_evidence = evidence_looks_like_header_only_table(
-            doc_snips,
-            semantic_tag,
-            keywords,
-            structured_items,
-        )
-        doc_sparse_table_blocks_present = doc_sparse_table_evidence and not (
-            is_diagram and doc_diagram_ready and bool(doc_diagram_refs)
-        )
-        doc_promote = should_promote_semantic_match(
-            topic_match=doc_topic_match,
-            topic_alignment=doc_topic_alignment,
-            keywords=keywords,
-            evidence_snippets=doc_snips,
-        ) and doc_structured_ready and doc_diagram_ready and not doc_sparse_table_blocks_present
-
-        if doc_promote:
-            doc_status = "PRESENT"
-            if doc_topic_alignment == "aligned":
-                doc_justification = (
-                    f"Document '{doc_key}' contains a well-aligned match for topic '{semantic_tag}'."
-                )
-            elif doc_topic_alignment == "misaligned":
-                doc_justification = (
-                    f"Document '{doc_key}' contains the topic content, but under a different section or label."
-                )
-            else:
-                doc_justification = (
-                    f"Document '{doc_key}' contains a strong semantic match for topic '{semantic_tag}'."
-                )
-        elif doc_sparse_table_blocks_present and doc_snips:
-            doc_status = "PARTIAL"
-            doc_justification = (
-                f"Document '{doc_key}' contains a table/header for topic '{semantic_tag}', but the retrieved table appears unpopulated or header-only."
-            )
-        elif enforce_structured_items and (
-            doc_structured_coverage["matched_count"]
-            or doc_topic_match in ("exact", "partial")
-            or doc_topic_alignment in ("aligned", "misaligned")
-        ):
-            doc_status = "PARTIAL" if (doc_snips or doc_diagram_refs) else "MISSING"
-            matched_items_text = ", ".join(doc_structured_coverage["matched_items"][:4]) or "none"
-            missing_items_text = ", ".join(doc_structured_coverage["missing_items"][:4]) or "none"
-            doc_justification = (
-                f"Document '{doc_key}' only partially covers the structured requirement. "
-                f"Matched: {matched_items_text}. Missing: {missing_items_text}."
-            )
-        elif is_diagram and (
-            doc_diagram_refs
-            or doc_topic_match in ("exact", "partial")
-            or doc_topic_alignment in ("aligned", "misaligned")
-        ):
-            doc_status = "PARTIAL" if (doc_snips or doc_diagram_refs) else "MISSING"
-            if doc_diagram_refs:
-                doc_justification = (
-                    f"Document '{doc_key}' returned diagram evidence, but the alignment to '{semantic_tag}' is only partial. "
-                    f"Diagram ref alignment={doc_diagram_ref_alignment or 'none'}."
-                )
-            else:
-                doc_justification = (
-                    f"Document '{doc_key}' has text evidence for this diagram topic, but no aligned diagram reference was confirmed."
-                )
-        elif doc_snips:
-            doc_status = "PARTIAL"
-            doc_justification = (
-                f"Document '{doc_key}' returned evidence snippets for this topic, but the match was not strong enough to confirm full coverage."
-            )
-        else:
-            doc_status = "MISSING"
-            doc_justification = (
-                f"Document '{doc_key}' did not return usable evidence for this topic."
-            )
-
-        observations.append({
-            "doc_id": doc_key,
-            "status": doc_status,
-            "justification": doc_justification,
-            "snippet_count": len(doc_snips),
-            "diagram_ref_count": len(doc_diagram_refs),
-            "match_strength": doc_topic_match,
-            "topic_alignment": doc_topic_alignment,
-            "matched_requirement_items": doc_structured_coverage["matched_items"],
-            "missing_requirement_items": doc_structured_coverage["missing_items"],
-            "diagram_reference_alignment": doc_diagram_ref_alignment,
-            "header_only_table_detected": doc_sparse_table_evidence,
-        })
-
-    return observations
-
 def pick_best_template_snippets_for_tag(
     tag_query: str,
     pdf_text: str,
@@ -2068,63 +1620,15 @@ def _vec_literal(vec: List[float]) -> str:
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
 
 
-def list_matching_evidence_doc_ids(
-    nar_id: str,
-    release_number: str,
-    rtype: str,
-    doc_id: Optional[str],
-    include_mm: bool = False,
-) -> List[str]:
-    """List evidence doc_ids in scope so mixed-document results can be explained."""
-    if doc_id:
-        return [doc_id]
-
-    params: Dict[str, Any] = {
-        "nar": nar_id,
-        "rel": release_number,
-        "rtype": rtype,
-    }
-    if include_mm:
-        sql = text(f"""
-            SELECT DISTINCT doc_id
-            FROM (
-                SELECT doc_id
-                FROM {TABLE_EVIDENCE}
-                WHERE nar_id=:nar AND release_number=:rel AND rtype=:rtype
-                UNION
-                SELECT doc_id
-                FROM {TABLE_MM_EVID}
-                WHERE nar_id=:nar AND release_number=:rel AND rtype=:rtype
-            ) scope_docs
-            WHERE doc_id IS NOT NULL AND doc_id <> ''
-            ORDER BY doc_id
-        """)
-    else:
-        sql = text(f"""
-            SELECT DISTINCT doc_id
-            FROM {TABLE_EVIDENCE}
-            WHERE nar_id=:nar AND release_number=:rel AND rtype=:rtype
-              AND doc_id IS NOT NULL AND doc_id <> ''
-            ORDER BY doc_id
-        """)
-
-    engine = get_engine()
-    with engine.connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
-    return [str(r[0]) for r in rows if r and (r[0] or "").strip()]
-
-
-def retrieve_evidence_records(
+def retrieve_evidence_snippets(
     query: str,
     nar_id: str,
     release_number: str,
     rtype: str,
     doc_id: Optional[str],
     top_n: int,
-) -> List[Dict[str, str]]:
-    """Retrieve evidence snippets with doc_id metadata using semantic search."""
-    threshold = 0.65  # STRONG VALIDATOR THRESHOLD: Filters out irrelevant noise
-
+) -> List[str]:
+    """Retrieve evidence snippets using semantic search."""
     q_emb = embed_query_text(query)
     vec = _vec_literal(q_emb)
     where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype"]
@@ -2134,97 +1638,47 @@ def retrieve_evidence_records(
         "rtype": rtype,
         "vec": vec,
         "topn": top_n,
-        "threshold": threshold
     }
     if doc_id:
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
-        
     sql = text(f"""
-        SELECT doc_id, chunk
+        SELECT chunk
         FROM {TABLE_EVIDENCE}
         WHERE {" AND ".join(where)}
-          AND (1 - (embedding <=> CAST(:vec AS vector))) > :threshold
-        ORDER BY (1 - (embedding <=> CAST(:vec AS vector))) DESC
+        ORDER BY embedding <-> CAST(:vec AS vector)
         LIMIT :topn
     """)
     engine = get_engine()
     with engine.connect() as conn:
         rows = conn.execute(sql, params).fetchall()
-        
-    return [
-        {"doc_id": str(r[0] or ""), "snippet": r[1]}
-        for r in rows
-        if r and (r[1] or "").strip()
-    ]
+    return [r[0] for r in rows if r and (r[0] or "").strip()]
 
 
-def retrieve_evidence_snippets(
+def retrieve_guidance_snippets(
     query: str,
-    nar_id: str,
-    release_number: str,
     rtype: str,
-    doc_id: Optional[str],
-    top_n: int,
+    top_n: int = 3,
 ) -> List[str]:
-    """Retrieve evidence snippets using semantic search + re-ranking."""
+    """Retrieve guidance snippets."""
+    try:
+        qv = embed_query_text(query)
+        vec = _vec_literal(qv)
+        sql = text(f"""
+            SELECT chunk
+            FROM {TABLE_GUIDANCE}
+            WHERE rtype=:rtype
+            ORDER BY embedding <-> CAST(:vec AS vector)
+            LIMIT :topn
+        """)
+        engine = get_engine()
+        with engine.connect() as c:
+            rows = c.execute(sql, {"rtype": rtype, "vec": vec, "topn": top_n}).fetchall()
+        return [r[0] for r in rows if r and r[0]]
+    except Exception as e:
+        logging.warning(f"guidance retrieval failed: {e}")
+        return []
 
-    threshold = 0.50  # slightly relaxed
-
-    q_emb = embed_query_text(query)
-    vec = _vec_literal(q_emb)
-
-    where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype"]
-    params = {
-        "nar": nar_id,
-        "rel": release_number,
-        "rtype": rtype,
-        "vec": vec,
-        "topn": 15,  # 🔥 fetch more initially
-    }
-
-    if doc_id:
-        where.append("doc_id=:doc_id")
-        params["doc_id"] = doc_id
-
-    sql = text(f"""
-        SELECT chunk, (1 - (embedding <=> CAST(:vec AS vector))) as similarity
-        FROM {TABLE_EVIDENCE}
-        WHERE {" AND ".join(where)}
-        ORDER BY similarity DESC
-        LIMIT :topn
-    """)
-
-    engine = get_engine()
-    with engine.connect() as conn:
-        rows = conn.execute(sql, params).fetchall()
-
-    # 🔥 RE-RANK in Python
-    scored = []
-    for r in rows:
-        chunk, sim = r
-        if not chunk or not chunk.strip():
-            continue
-
-        # 🔥 keyword boost
-        keyword_bonus = 0
-        query_words = query.lower().split()
-        text = chunk.lower()
-
-        matches = sum(1 for w in query_words if w in text)
-        if matches > 0:
-            keyword_bonus = matches / len(query_words)
-
-        final_score = 0.7 * sim + 0.3 * keyword_bonus
-
-        if final_score >= threshold:
-            scored.append((final_score, chunk))
-
-    # 🔥 sort + keep top 5 only
-    scored.sort(reverse=True, key=lambda x: x[0])
-    final_chunks = [c for _, c in scored[:5]]
-
-    return final_chunks
 
 def retrieve_mm_diagrams(
     query_text: str,
@@ -2250,7 +1704,7 @@ def retrieve_mm_diagrams(
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
     sql = text(f"""
-        SELECT doc_id, caption, doc_uri
+        SELECT caption, doc_uri
         FROM {TABLE_MM_EVID}
         WHERE {" AND ".join(where)}
         ORDER BY embedding <-> CAST(:vec AS vector)
@@ -2259,10 +1713,7 @@ def retrieve_mm_diagrams(
     engine = get_engine()
     with engine.connect() as c:
         rows = c.execute(sql, params).fetchall()
-    return [
-        {"doc_id": str(r[0] or ""), "caption": r[1], "doc_uri": r[2]}
-        for r in rows
-    ]
+    return [{"caption": r[0], "doc_uri": r[1]} for r in rows]
 
 
 def retrieve_mm_diagrams_safe(
@@ -2316,15 +1767,11 @@ Judge semantic content, not exact section numbering.
 If the right content appears under a different numbering or heading label (for example 1.2 instead of 1.1), do NOT mark it PARTIAL or MISSING for that reason alone.
 Only mark PARTIAL or MISSING when required content itself is incomplete, generic, contradictory, or absent.
 
-Structured completeness rule:
-If STRUCTURED REQUIREMENT ITEMS are listed, do not mark PRESENT unless the evidence covers those expected rows, columns, or checklist items, not just the general topic.
-
 TAG: {tag}
 INTENT: {intent}
 SEMANTIC TAG: {semantic_tag}
 NOTES: {notes}
 REQUIRED: {required_flag}
-STRUCTURED REQUIREMENT ITEMS: {structured_items}
 
 TEMPLATE PDF EXCERPTS:
 {template_pdf_excerpts}
@@ -2361,15 +1808,11 @@ Important evaluation rule:
 Judge semantic alignment, not exact section numbering.
 If the diagram/content is present under a different numbered section, do NOT penalize that numbering mismatch by itself.
 
-Diagram acceptance rule:
-Do not mark PRESENT unless the referenced diagrams appear aligned to the requested diagram type. If STRUCTURED REQUIREMENT ITEMS are listed, use them to judge whether the expected diagram content is actually evidenced.
-
 TAG: {tag}
 INTENT: {intent}
 SEMANTIC TAG: {semantic_tag}
 NOTES: {notes}
 REQUIRED: {required_flag}
-STRUCTURED REQUIREMENT ITEMS: {structured_items}
 
 TEMPLATE_PDF_EXCERPTS:
 {template_pdf_excerpts}
@@ -2481,29 +1924,10 @@ def run_validation(
         pdf_text = ""
 
     results: List[Dict[str, Any]] = []
-    text_scope_doc_ids = list_matching_evidence_doc_ids(
-        nar_id,
-        release_number,
-        rtype,
-        effective_doc_id,
-        include_mm=False,
-    )
-    multimodal_scope_doc_ids = (
-        list_matching_evidence_doc_ids(
-            nar_id,
-            release_number,
-            rtype,
-            effective_doc_id,
-            include_mm=True,
-        )
-        if enable_mm
-        else text_scope_doc_ids
-    )
 
     # Iterate over template
     for intent_name, child in requirement_nodes:
         tag = (child.get("tag") or "").strip()
-        source = (child.get("source") or "").strip().lower()
         semantic_tag = semantic_tag_text(tag)
         mreq = _get_bool_flag(child, "musthave", "mustHave")
         greq = _get_bool_flag(child, "goodToHave", "goodtohave", "good_to_have")
@@ -2512,35 +1936,8 @@ def run_validation(
         conds = (child.get("conditions", "") or "").strip()
 
         kws = child.get("keywords") or []
-        structured_items = extract_structured_requirement_items(notes, conds)
         requirement_phrases = extract_requirement_phrases(notes, conds)
-        alias_terms = expand_topic_aliases(tag, semantic_tag, kws, notes, conds)
-        combined_match_terms: List[str] = []
-        seen_match_terms = set()
-        for candidate in [
-            *[k for k in kws if isinstance(k, str)],
-            *alias_terms,
-            *requirement_phrases,
-            *structured_items,
-        ]:
-            normalized_candidate = _normalize_match_text(candidate)
-            if normalized_candidate and normalized_candidate not in seen_match_terms:
-                seen_match_terms.add(normalized_candidate)
-                combined_match_terms.append(candidate)
-
-        required_items = (
-        (child.get("expectedElements") or []) +
-        (child.get("expectedTableColumns") or [])
-        )
-
-        enforce_structured_items = is_table_like_requirement(
-            tag,
-            notes,
-            conds,
-            source,
-            required_items
-        ) and len(structured_items) >= 2
-        structured_items_block = ", ".join(structured_items) if structured_items else "(none)"
+        combined_match_terms = [k for k in kws if isinstance(k, str)] + requirement_phrases
 
         kw_text = " ".join(
             k.strip()
@@ -2560,13 +1957,14 @@ def run_validation(
         topic_search_phrases = build_topic_search_phrases(
             semantic_tag,
             tag,
-            combined_match_terms,
+            kws,
+            requirement_phrases=requirement_phrases,
         )
         query_full = topic_queries[0] if topic_queries else " ".join(
             s for s in [semantic_tag, kw_text] if s
         ).strip()
 
-        ev_records = retrieve_topic_evidence_records(
+        ev_snips = retrieve_topic_evidence_snippets(
             topic_queries,
             nar_id,
             release_number,
@@ -2575,7 +1973,6 @@ def run_validation(
             top_k,
             topic_search_phrases,
         )
-        ev_snips = [record["snippet"] for record in ev_records]
         s_join = build_compact_prompt_block(
             ev_snips[:top_k],
             empty_value="(no snippets found)",
@@ -2584,7 +1981,7 @@ def run_validation(
             max_total_chars=2600,
         )
 
-        g_snips = retrieve_evidence_snippets(query_full, nar_id, release_number, rtype, effective_doc_id, top_n=3)
+        g_snips = retrieve_guidance_snippets(query_full, rtype, top_n=3)
         g_join = build_compact_prompt_block(
             g_snips,
             empty_value="(no guidance context)",
@@ -2606,12 +2003,16 @@ def run_validation(
             max_total_chars=1000,
         )
 
-        is_diagram = is_diagram_requirement(tag, notes, conds, kws)
+        is_diagram = (
+            ("diagram" in tag.lower())
+            or ("diagram" in notes.lower())
+            or ("diagram" in conds.lower())
+            or any(isinstance(k, str) and "diagram" in k.lower() for k in kws)
+        )
 
-        raw_mm_hits: List[Dict[str, str]] = []
         mm_hits: List[Dict[str, str]] = []
         if enable_mm and is_diagram:
-            raw_mm_hits = retrieve_mm_diagrams_safe(
+            mm_hits = retrieve_mm_diagrams_safe(
                 query_full,
                 nar_id,
                 release_number,
@@ -2620,17 +2021,6 @@ def run_validation(
                 top_n=3,
                 dim=MM_DIM,
             )
-            mm_hits = filter_relevant_diagram_refs(
-                semantic_tag,
-                combined_match_terms,
-                raw_mm_hits,
-            )
-            if len(mm_hits) != len(raw_mm_hits):
-                logging.info(
-                    "Filtered %s non-aligned diagram ref(s) for tag '%s'.",
-                    len(raw_mm_hits) - len(mm_hits),
-                    tag,
-                )
             diag_lines = [
                 _truncate_text(f"{hit['caption']}: {hit['doc_uri']}", 260)
                 for hit in mm_hits
@@ -2645,7 +2035,6 @@ def run_validation(
                 required_flag=(
                     "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
                 ),
-                structured_items=_truncate_text(structured_items_block, 400),
                 template_pdf_excerpts=pdf_join,
                 guidance=g_join,
                 evidence=s_join,
@@ -2659,7 +2048,6 @@ def run_validation(
                 required_flag=(
                     "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
                 ),
-                structured_items=_truncate_text(structured_items_block, 240),
                 template_pdf_excerpts=build_compact_prompt_block(
                     pdf_excerpts,
                     empty_value="(no template-pdf excerpt)",
@@ -2721,7 +2109,6 @@ def run_validation(
                 required_flag=(
                     "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
                 ),
-                structured_items=_truncate_text(structured_items_block, 400),
                 template_pdf_excerpts=pdf_join,
                 guidance=g_join,
                 evidence=s_join,
@@ -2734,7 +2121,6 @@ def run_validation(
                 required_flag=(
                     "MUST HAVE" if mreq else ("GOOD_TO_HAVE" if greq else "OPTIONAL")
                 ),
-                structured_items=_truncate_text(structured_items_block, 240),
                 template_pdf_excerpts=build_compact_prompt_block(
                     pdf_excerpts,
                     empty_value="(no template-pdf excerpt)",
@@ -2799,64 +2185,13 @@ def run_validation(
             combined_match_terms,
             ev_snips,
         )
-        diagram_ref_alignment = (
-            semantic_topic_match_strength(
-                semantic_tag,
-                combined_match_terms,
-                build_diagram_reference_texts(mm_hits),
-            )
-            if is_diagram and mm_hits
-            else None
-        )
-        structured_item_coverage = assess_requirement_item_coverage(
-            structured_items,
-            ev_snips + (build_diagram_reference_texts(mm_hits) if is_diagram else []),
-        )
-        structured_partially_covered = requirement_items_partially_covered(
-            structured_item_coverage
-        )
-        sparse_table_evidence = evidence_looks_like_header_only_table(
-            ev_snips,
-            semantic_tag,
-            combined_match_terms,
-            structured_items,
-        )
         topic_alignment = topic_alignment_status(tag, semantic_tag, ev_snips)
-        structured_ready_for_present = (
-            not enforce_structured_items
-            or requirement_items_ready_for_present(structured_item_coverage)
-        )
-        diagram_ready_for_present = (
-            topic_match == "exact"
-            if is_diagram and not enable_mm
-            else (
-                not is_diagram
-                or (
-                    (
-                        bool(mm_hits)
-                        and (
-                            diagram_ref_alignment in ("exact", "partial")
-                            or topic_match == "exact"
-                            or topic_alignment in ("aligned", "misaligned")
-                        )
-                    )
-                    or (
-                        not mm_hits
-                        and topic_match == "exact"
-                        and topic_alignment in ("aligned", "misaligned")
-                    )
-                )
-            )
-        )
-        sparse_table_blocks_present = sparse_table_evidence and not (
-            is_diagram and diagram_ready_for_present and bool(mm_hits)
-        )
         promote_semantic_match = should_promote_semantic_match(
             topic_match=topic_match,
             topic_alignment=topic_alignment,
             keywords=combined_match_terms,
             evidence_snippets=ev_snips,
-        ) and structured_ready_for_present and diagram_ready_for_present and not sparse_table_blocks_present
+        )
 
         if promote_semantic_match and status in ("MISSING", "PARTIAL", "ERROR"):
             status = "PRESENT"
@@ -2896,110 +2231,16 @@ def run_validation(
             status = "PRESENT"
             justification = f"R-Type '{rtype}' was provided for validation."
 
-        if sparse_table_blocks_present and status == "PRESENT":
-            status = "PARTIAL" if ev_snips else "MISSING"
-            justification = (
-                f"Topic '{semantic_tag}' matched a table/header, but the retrieved evidence looks like an unpopulated or header-only table without substantive values."
+        justification = (justification or "").strip()
+        if not justification:
+            justification = _default_validation_justification(
+                tag=tag,
+                status=status,
+                evidence_snippets=ev_snips,
+                topic_match=topic_match,
+                topic_alignment=topic_alignment,
+                validation_error=result_validation_error,
             )
-
-        if sparse_table_blocks_present and status in ("MISSING", "EMPTY", "ERROR") and ev_snips:
-            status = "PARTIAL"
-            justification = (
-                f"Topic '{semantic_tag}' appears as a table/header in the evidence, but the table values do not look populated enough to confirm full coverage."
-            )
-
-        if enforce_structured_items and status == "PRESENT" and not structured_ready_for_present:
-            missing_items_text = ", ".join(structured_item_coverage["missing_items"][:4]) or "none"
-            matched_items_text = ", ".join(structured_item_coverage["matched_items"][:4]) or "none"
-            status = "PARTIAL" if (ev_snips or structured_item_coverage["matched_count"]) else "MISSING"
-            justification = (
-                f"Topic '{semantic_tag}' was not kept as PRESENT because the template lists explicit required items and "
-                f"the retrieved evidence only matched {structured_item_coverage['matched_count']}/"
-                f"{structured_item_coverage['total_count']}. Matched: {matched_items_text}. "
-                f"Missing: {missing_items_text}."
-            )
-
-        if enforce_structured_items and status in ("MISSING", "EMPTY", "ERROR") and (
-            structured_partially_covered
-            or topic_match in ("exact", "partial")
-            or topic_alignment in ("aligned", "misaligned")
-        ):
-            missing_items_text = ", ".join(structured_item_coverage["missing_items"][:4]) or "none"
-            matched_items_text = ", ".join(structured_item_coverage["matched_items"][:4]) or "none"
-            status = "PARTIAL"
-            justification = (
-                f"Topic '{semantic_tag}' has structured or topic-level evidence, but not enough confirmed coverage to keep it PRESENT. "
-                f"Matched structured items: {matched_items_text}. Still missing: {missing_items_text}."
-            )
-
-        if is_diagram and status == "PRESENT" and not diagram_ready_for_present:
-            status = "PARTIAL" if (mm_hits or ev_snips) else "MISSING"
-            if enable_mm:
-                if mm_hits:
-                    justification = (
-                        f"Diagram topic '{semantic_tag}' has diagram references, but they are not clearly aligned to the required diagram type. "
-                        f"Diagram ref alignment={diagram_ref_alignment or 'none'}."
-                    )
-                else:
-                    justification = (
-                        f"Diagram topic '{semantic_tag}' was not kept as PRESENT because no aligned diagram references were retrieved."
-                    )
-            else:
-                justification = (
-                    f"Diagram topic '{semantic_tag}' was only checked via text evidence because multimodal validation is disabled, "
-                    "so PRESENT requires an exact textual diagram match."
-                )
-
-        if is_diagram and status in ("MISSING", "EMPTY", "ERROR") and (mm_hits or topic_alignment or topic_match in ("exact", "partial")):
-            status = "PARTIAL"
-            if mm_hits:
-                justification = (
-                    f"Diagram topic '{semantic_tag}' has some diagram or text evidence, but the validator could not confirm a fully aligned diagram reference. "
-                    f"Diagram ref alignment={diagram_ref_alignment or 'none'}, topic alignment={topic_alignment or 'none'}."
-                )
-            else:
-                justification = (
-                    f"Diagram topic '{semantic_tag}' has text evidence, but no clearly aligned multimodal diagram reference was confirmed."
-                )
-
-        candidate_doc_ids = (
-            multimodal_scope_doc_ids
-            if is_diagram and enable_mm
-            else text_scope_doc_ids
-        )
-        per_document_observations = build_per_document_observations(
-            candidate_doc_ids=candidate_doc_ids,
-            tag=tag,
-            semantic_tag=semantic_tag,
-            keywords=combined_match_terms,
-            structured_items=structured_items,
-            enforce_structured_items=enforce_structured_items,
-            is_diagram=is_diagram,
-            enable_mm=enable_mm,
-            evidence_records=ev_records,
-            diagram_refs=raw_mm_hits if is_diagram else [],
-        )
-        per_document_statuses = {
-            observation["status"] for observation in per_document_observations
-        }
-        if len(per_document_observations) <= 1:
-            document_consistency = "single-document"
-        elif len(per_document_statuses) == 1:
-            document_consistency = f"all-{next(iter(per_document_statuses)).lower()}"
-        else:
-            document_consistency = "mixed"
-
-        if document_consistency == "mixed":
-            variance_parts = [
-                f"{observation['doc_id']}={observation['status']}"
-                for observation in per_document_observations[:4]
-            ]
-            if len(per_document_observations) > 4:
-                variance_parts.append(f"... ({len(per_document_observations)} docs total)")
-            variance_note = "Per-document coverage varies: " + "; ".join(variance_parts) + "."
-            justification = (f"{justification} {variance_note}" if justification else variance_note).strip()
-
-
 
         results.append({
             "intent": intent_name,
@@ -3017,17 +2258,6 @@ def run_validation(
             "fallback_used": bool(validation_error),
             "match_strength": topic_match,
             "topic_alignment": topic_alignment,
-            "structured_requirement_items": structured_items,
-            "matched_requirement_items": structured_item_coverage["matched_items"],
-            "missing_requirement_items": structured_item_coverage["missing_items"],
-            "structured_requirement_gate_passed": structured_ready_for_present,
-            "diagram_expected": is_diagram,
-            "diagram_reference_alignment": diagram_ref_alignment,
-            "diagram_ready_for_present": diagram_ready_for_present,
-            "header_only_table_detected": sparse_table_evidence,
-            "document_consistency": document_consistency,
-            "per_document_observations": per_document_observations,
-            "evidence_document_count": len(candidate_doc_ids),
             "evidence_snippet_count": len(ev_snips),
             "guidance_snippet_count": len(g_snips),
             "template_pdf_snippet_count": len(pdf_excerpts),
@@ -3100,14 +2330,6 @@ def run_validation(
         "good_to_have_coverage_pct": round((good_met / good_total * 100.0), 1) if good_total else 0.0,
         "fallback_topic_count": sum(1 for item in results if item.get("fallback_used")),
         "topics_with_validator_warnings": sum(1 for item in results if item.get("validator_error")),
-        "topics_with_structured_item_gaps": sum(
-            1 for item in results if item.get("missing_requirement_items")
-        ),
-        "diagram_topics_without_clear_alignment": sum(
-            1
-            for item in results
-            if item.get("diagram_expected") and not item.get("diagram_ready_for_present")
-        ),
         "architecture_evidence_snippet_count": len(arch_snips),
         "architecture_diagram_ref_count": len(arch_mm_hits),
         "architecture_template_excerpt_count": len(arch_pdf),
