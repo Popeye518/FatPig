@@ -454,6 +454,18 @@ class CsvChunkSource:
     text: str
 
 
+@dataclass(frozen=True)
+class ExtractedImageAsset:
+    page_num: Optional[int]
+    chunk_index: int
+    img_bytes: bytes
+    caption: str
+    asset_label: str
+    nearby_heading: Optional[str] = None
+    preceding_text: Optional[str] = None
+    page_text_excerpt: Optional[str] = None
+
+
 def _version_string(value: Any) -> Optional[str]:
     if value in (None, ""):
         return None
@@ -507,6 +519,103 @@ def _sha_parts(*parts: Any) -> str:
 def _vec_literal(vec: List[float]) -> str:
     """Format vector as PostgreSQL pgvector literal."""
     return "[" + ",".join(f"{x:.6f}" for x in vec) + "]"
+
+
+def _normalize_context_text(text_in: str) -> str:
+    """Normalize extracted layout text for compact metadata storage."""
+    return re.sub(r"\s+", " ", (text_in or "").replace("\x00", " ")).strip()
+
+
+def _truncate_context_text(text_in: str, max_chars: int) -> str:
+    """Trim context text to a stable maximum length."""
+    normalized = _normalize_context_text(text_in)
+    if len(normalized) <= max_chars:
+        return normalized
+    return normalized[: max_chars - 3].rstrip() + "..."
+
+
+def _extract_pdf_text_block_text(block: Dict[str, Any]) -> str:
+    """Flatten a PyMuPDF text block into readable text."""
+    lines: List[str] = []
+    for line in block.get("lines") or []:
+        spans: List[str] = []
+        for span in line.get("spans") or []:
+            span_text = _normalize_context_text(span.get("text", ""))
+            if span_text:
+                spans.append(span_text)
+        if spans:
+            lines.append(" ".join(spans))
+    if lines:
+        return "\n".join(lines)
+    return _normalize_context_text(str(block.get("text") or ""))
+
+
+def _looks_like_heading_candidate(text_in: str) -> bool:
+    """Heuristically detect section headings near diagrams."""
+    raw_lines = [
+        _normalize_context_text(line)
+        for line in re.split(r"\r?\n", text_in or "")
+    ]
+    raw_lines = [line for line in raw_lines if line]
+    if not raw_lines or len(raw_lines) > 3:
+        return False
+    normalized = " ".join(raw_lines).strip()
+    if len(normalized) < 4 or len(normalized) > 180:
+        return False
+    lower = normalized.lower()
+    if re.match(r"^[A-Za-z]?\d+(?:[.\s]+\d+)*(?:\.[a-z])?\s+\S", normalized):
+        return True
+    if any(token in lower for token in ("diagram", "architecture", "model", "flow", "component", "interface")):
+        return True
+    if normalized.endswith(":"):
+        return True
+    word_count = len(normalized.split())
+    if word_count <= 12 and not normalized.endswith("."):
+        alpha_chars = sum(1 for char in normalized if char.isalpha())
+        return alpha_chars >= max(3, int(len(normalized) * 0.55))
+    return False
+
+
+def _select_nearest_heading(block_texts: List[str]) -> Optional[str]:
+    """Choose the nearest likely heading from preceding text blocks."""
+    for text in reversed(block_texts[-6:]):
+        if _looks_like_heading_candidate(text):
+            return _truncate_context_text(text, 180)
+    return None
+
+
+def _build_preceding_text_context(
+    block_texts: List[str],
+    nearby_heading: Optional[str],
+) -> Optional[str]:
+    """Build a short nearby-text context window for an image asset."""
+    heading_norm = _normalize_context_text(nearby_heading or "")
+    recent_blocks: List[str] = []
+    for text in block_texts[-3:]:
+        normalized = _normalize_context_text(text)
+        if not normalized or normalized == heading_norm:
+            continue
+        recent_blocks.append(normalized)
+    if not recent_blocks:
+        return nearby_heading
+    return _truncate_context_text(" | ".join(recent_blocks), 220)
+
+
+def _build_image_context_caption(
+    asset_label: str,
+    nearby_heading: Optional[str],
+    preceding_text: Optional[str],
+) -> str:
+    """Build a caption that carries nearby section context into the MM embedding."""
+    caption_parts: List[str] = []
+    if nearby_heading:
+        caption_parts.append(_normalize_context_text(nearby_heading))
+    normalized_preceding = _normalize_context_text(preceding_text or "")
+    if normalized_preceding and normalized_preceding not in caption_parts:
+        caption_parts.append(normalized_preceding)
+    if not caption_parts:
+        return asset_label
+    return _truncate_context_text(" | ".join(caption_parts), 220)
 
 
 def resolve_rtype(user_val: str) -> str:
@@ -1093,24 +1202,101 @@ def txt_text(txt_path: str) -> str:
 # Image Extraction (NO page snapshots)
 # ============================================================================
 
-def extract_pdf_images(pdf_path: str) -> List[Tuple[int, int, bytes, str]]:
-    """Returns list of: (page_num, img_index_on_page, img_bytes_png, caption).
-    
-    Only real images embedded in the PDF are extracted.
-    """
-    out: List[Tuple[int, int, bytes, str]] = []
+def extract_pdf_images(pdf_path: str) -> List[ExtractedImageAsset]:
+    """Extract embedded PDF images with nearby heading/text context when available."""
+    out: List[ExtractedImageAsset] = []
     doc = fitz.open(pdf_path)
     for pno in range(len(doc)):
         page = doc[pno]
-        imgs = page.get_images(full=True) or []
-        for i, img in enumerate(imgs):
-            xref = img[0]
+        page_images = page.get_images(full=True) or []
+        if not page_images:
+            continue
+
+        try:
+            blocks = (page.get_text("dict", sort=True) or {}).get("blocks") or []
+        except Exception as exc:
+            logging.debug(f"[PDF][IMG] Failed to extract layout blocks from page {pno + 1} of '{pdf_path}': {exc}")
+            blocks = []
+
+        preceding_text_blocks: List[str] = []
+        image_index = 0
+        for block in blocks:
+            if block.get("type") == 0:
+                block_text = _extract_pdf_text_block_text(block)
+                if block_text:
+                    preceding_text_blocks.append(block_text)
+                continue
+            if block.get("type") != 1:
+                continue
+
+            image_index += 1
+            if image_index > len(page_images):
+                continue
+
+            xref = page_images[image_index - 1][0]
             pix = fitz.Pixmap(doc, xref)
             if pix.n == 4:  # CMYK -> RGB
                 pix = fitz.Pixmap(fitz.csRGB, pix)
             img_bytes = pix.tobytes("png")
-            caption = f"page{pno + 1}_img{i + 1}"
-            out.append((pno + 1, i + 1, img_bytes, caption))
+            asset_label = f"page{pno + 1}_img{image_index}"
+            nearby_heading = _select_nearest_heading(preceding_text_blocks)
+            preceding_text = _build_preceding_text_context(
+                preceding_text_blocks,
+                nearby_heading,
+            )
+            page_text_excerpt = _truncate_context_text(
+                " ".join(preceding_text_blocks[-6:]),
+                320,
+            ) or None
+            out.append(
+                ExtractedImageAsset(
+                    page_num=pno + 1,
+                    chunk_index=image_index,
+                    img_bytes=img_bytes,
+                    caption=_build_image_context_caption(
+                        asset_label,
+                        nearby_heading,
+                        preceding_text,
+                    ),
+                    asset_label=asset_label,
+                    nearby_heading=nearby_heading,
+                    preceding_text=preceding_text,
+                    page_text_excerpt=page_text_excerpt,
+                )
+            )
+
+        for fallback_index in range(image_index + 1, len(page_images) + 1):
+            xref = page_images[fallback_index - 1][0]
+            pix = fitz.Pixmap(doc, xref)
+            if pix.n == 4:  # CMYK -> RGB
+                pix = fitz.Pixmap(fitz.csRGB, pix)
+            img_bytes = pix.tobytes("png")
+            asset_label = f"page{pno + 1}_img{fallback_index}"
+            nearby_heading = _select_nearest_heading(preceding_text_blocks)
+            preceding_text = _build_preceding_text_context(
+                preceding_text_blocks,
+                nearby_heading,
+            )
+            page_text_excerpt = _truncate_context_text(
+                " ".join(preceding_text_blocks[-6:]),
+                320,
+            ) or None
+            out.append(
+                ExtractedImageAsset(
+                    page_num=pno + 1,
+                    chunk_index=fallback_index,
+                    img_bytes=img_bytes,
+                    caption=_build_image_context_caption(
+                        asset_label,
+                        nearby_heading,
+                        preceding_text,
+                    ),
+                    asset_label=asset_label,
+                    nearby_heading=nearby_heading,
+                    preceding_text=preceding_text,
+                    page_text_excerpt=page_text_excerpt,
+                )
+            )
     doc.close()
     return out
 
@@ -1526,14 +1712,21 @@ def ingest_evidence_images_file(
         "parser_version": image_parser_version,
     }
     
-    images: List[Tuple[Optional[int], int, bytes, str]] = []
+    images: List[ExtractedImageAsset] = []
     
     if ext == ".pdf":
-        for page_num, idx_on_page, img_bytes, caption in extract_pdf_images(file_path):
-            images.append((page_num, idx_on_page, img_bytes, caption))
+        images.extend(extract_pdf_images(file_path))
     elif ext == ".docx":
         for chunk_index, img_bytes, caption in extract_docx_images(file_path):
-            images.append((None, chunk_index, img_bytes, caption))
+            images.append(
+                ExtractedImageAsset(
+                    page_num=None,
+                    chunk_index=chunk_index,
+                    img_bytes=img_bytes,
+                    caption=caption,
+                    asset_label=caption,
+                )
+            )
     elif ext == ".csv":
         csv_imgs = parse_csv_image_rows(
             file_path,
@@ -1541,7 +1734,16 @@ def ingest_evidence_images_file(
             caption_column=csv_caption_column,
         )
         for row_num, idx_in_row, img_bytes, caption in csv_imgs:
-            images.append((None, idx_in_row, img_bytes, f"row{row_num}_{caption}"))
+            asset_label = f"row{row_num}_{caption}"
+            images.append(
+                ExtractedImageAsset(
+                    page_num=None,
+                    chunk_index=idx_in_row,
+                    img_bytes=img_bytes,
+                    caption=asset_label,
+                    asset_label=asset_label,
+                )
+            )
     else:
         return 0
     
@@ -1552,22 +1754,26 @@ def ingest_evidence_images_file(
     logging.info(f"[IMG] {len(images)} embedded images found in: {file_path}")
     
     with engine.begin() as conn:
-        for (page_num, chunk_index, img_bytes, caption) in images:
-            vec = mm_embed_image_with_caption(img_bytes, caption=caption, dim=mm_dim)
+        for asset in images:
+            vec = mm_embed_image_with_caption(asset.img_bytes, caption=asset.caption, dim=mm_dim)
             md = dict(common_md)
             md.update({
-                "page_num": page_num,
-                "chunk_index": chunk_index,
-                "caption": caption,
+                "page_num": asset.page_num,
+                "chunk_index": asset.chunk_index,
+                "caption": asset.caption,
+                "asset_label": asset.asset_label,
+                "nearby_heading": asset.nearby_heading,
+                "preceding_text": asset.preceding_text,
+                "page_text_excerpt": asset.page_text_excerpt,
             })
             chunk_hash = compute_image_chunk_hash(
                 nar_id,
                 release_number,
                 document_hash,
-                page_num,
-                chunk_index,
-                caption,
-                img_bytes,
+                asset.page_num,
+                asset.chunk_index,
+                asset.caption,
+                asset.img_bytes,
             )
             res = conn.execute(ins_sql, {
                 "id": str(uuid.uuid4()),
@@ -1578,10 +1784,10 @@ def ingest_evidence_images_file(
                 "doc_hash": document_hash,
                 "doc_id": doc_id,
                 "doc_uri": doc_uri,
-                "caption": caption,
-                "page_num": page_num,
+                "caption": asset.caption,
+                "page_num": asset.page_num,
                 "embedding": _vec_literal(vec),
-                "chunk_index": chunk_index,
+                "chunk_index": asset.chunk_index,
                 "chunk": None,
                 "chunk_hash": chunk_hash,
                 "metadata": json.dumps(md),
