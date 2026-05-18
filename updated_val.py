@@ -758,15 +758,12 @@ def generate_structured_json_with_compact_retry(
 def generate_architecture_summary_json(
     template_pdf_excerpts: str,
     evidence_snippets: List[str],
-    diagram_refs: Optional[List[Dict[str, str]]] = None,
+    diagram_refs: Optional[List[Dict[str, Any]]] = None,
 ) -> Tuple[Dict[str, Any], Optional[str]]:
     """Generate architecture summary JSON with compact retry handling."""
     diagram_refs = diagram_refs or []
     diagram_block = "\n".join(
-        _truncate_text(
-            f"{ref.get('caption', '')}: {ref.get('doc_uri', '')}".strip(" :"),
-            240,
-        )
+        _format_diagram_ref(ref, max_len=240)
         for ref in diagram_refs[:4]
         if ref.get("caption") or ref.get("doc_uri")
     ) or "(None)"
@@ -1038,6 +1035,23 @@ def _tokenize_match_text(text_in: str) -> List[str]:
     return re.findall(r"[a-z0-9]+", (text_in or "").lower())
 
 
+MATCH_TOKEN_STOP_WORDS = {
+    "and", "the", "for", "with", "from", "into", "that", "this",
+    "have", "must", "good", "include", "table", "section", "application",
+    "overview", "details", "link", "keep", "applicable",
+}
+
+
+def _meaningful_match_tokens(text_in: str, min_length: int = 5) -> List[str]:
+    """Return de-duplicated, content-bearing tokens for matching and retrieval."""
+    tokens: List[str] = []
+    for token in _tokenize_match_text(text_in):
+        if len(token) < min_length or token in MATCH_TOKEN_STOP_WORDS or token in tokens:
+            continue
+        tokens.append(token)
+    return tokens
+
+
 def _load_template_nodes(template_json_path: str) -> List[Dict[str, Any]]:
     """Load template nodes from either a top-level list or an object with children."""
     with open(template_json_path, "r", encoding="utf-8") as f:
@@ -1131,11 +1145,11 @@ def _resolve_unique_doc_id_from_db_scope(
 def _build_architecture_fallback(
     arch_snips: List[str],
     architecture_error: Optional[str],
-    diagram_refs: Optional[List[Dict[str, str]]] = None,
+    diagram_refs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build a deterministic architecture summary when the model returns unusable output."""
     diagram_refs = diagram_refs or []
-    diagram_text = " ".join(f"{ref.get('caption','')} {ref.get('doc_uri','')}" for ref in diagram_refs)
+    diagram_text = " ".join(_diagram_ref_search_text(ref) for ref in diagram_refs)
     evidence_text = _normalize_match_text(" ".join(arch_snips) + " " + diagram_text)
 
     def _has_any(*tokens: str) -> bool:
@@ -1173,10 +1187,7 @@ def _build_architecture_fallback(
         "physical_present": physical_present,
         "label_alignment_issues": [],
         "diagram_refs": [
-            _truncate_text(
-                f"{ref.get('caption', '')}: {ref.get('doc_uri', '')}".strip(" :"),
-                180,
-            )
+            _format_diagram_ref(ref, max_len=180)
             for ref in diagram_refs[:3]
             if ref.get("caption") or ref.get("doc_uri")
         ],
@@ -1193,7 +1204,7 @@ def _build_topic_validation_fallback(
     template_pdf_snippets: List[str],
     validation_error: Optional[str],
     is_diagram: bool = False,
-    diagram_refs: Optional[List[Dict[str, str]]] = None,
+    diagram_refs: Optional[List[Dict[str, Any]]] = None,
 ) -> Dict[str, Any]:
     """Build a deterministic topic-level fallback when the model returns unusable output."""
     diagram_refs = diagram_refs or []
@@ -1204,9 +1215,9 @@ def _build_topic_validation_fallback(
     diagram_present = bool(diagram_refs)
 
     if is_diagram:
-        if diagram_present or topic_match in ("exact", "partial"):
+        if diagram_present:
             status = "PRESENT"
-        elif evidence_present:
+        elif evidence_present or topic_match in ("exact", "partial"):
             status = "PARTIAL"
         else:
             status = "MISSING"
@@ -1225,7 +1236,7 @@ def _build_topic_validation_fallback(
 
         citations = {
             "diagram": [
-                _truncate_text(ref.get("caption", ""), 180)
+                _format_diagram_ref(ref, max_len=180)
                 for ref in diagram_refs[:2]
             ],
             "text": [
@@ -1392,22 +1403,37 @@ def retrieve_keyword_evidence_hits(
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
     phrase_conditions = []
-    exact_checks = []
+    score_terms = []
     for idx, (raw_phrase, normalized_phrase) in enumerate(valid_phrases):
         like_key = f"phrase_{idx}"
         exact_key = f"exact_{idx}"
         params[like_key] = f"%{raw_phrase}%"
         params[exact_key] = f"%{normalized_phrase}%"
         phrase_conditions.append(f"chunk ILIKE :{like_key}")
-        exact_checks.append(
-            f"CASE WHEN lower(regexp_replace(chunk, '[^a-zA-Z0-9]', '', 'g')) LIKE :{exact_key} THEN 0 ELSE 1 END"
+        score_terms.append(
+            f"CASE WHEN lower(regexp_replace(chunk, '[^a-zA-Z0-9]', '', 'g')) LIKE :{exact_key} THEN 8 ELSE 0 END"
         )
+        score_terms.append(f"CASE WHEN chunk ILIKE :{like_key} THEN 6 ELSE 0 END")
+
+        phrase_tokens = _meaningful_match_tokens(raw_phrase, min_length=4)
+        if phrase_tokens:
+            token_score_terms = []
+            for token_idx, token in enumerate(phrase_tokens[:5]):
+                token_key = f"token_{idx}_{token_idx}"
+                params[token_key] = f"%{token}%"
+                token_score_terms.append(f"CASE WHEN chunk ILIKE :{token_key} THEN 1 ELSE 0 END")
+            token_score_expr = " + ".join(token_score_terms)
+            required_hits = 1 if len(phrase_tokens) == 1 else min(3, max(2, (len(phrase_tokens) + 1) // 2))
+            phrase_conditions.append(f"(({token_score_expr}) >= {required_hits})")
+            score_terms.append(f"({token_score_expr})")
+    lexical_score_sql = " + ".join(score_terms) if score_terms else "0"
     sql = text(f"""
-        SELECT chunk, chunk_hash, doc_id, doc_uri, page_num, chunk_index, metadata
+        SELECT chunk, chunk_hash, doc_id, doc_uri, page_num, chunk_index, metadata,
+               ({lexical_score_sql}) AS score
         FROM {TABLE_EVIDENCE}
         WHERE {" AND ".join(where)}
           AND ({" OR ".join(phrase_conditions)})
-        ORDER BY {", ".join(exact_checks)}, length(chunk)
+        ORDER BY score DESC, length(chunk)
         LIMIT :topn
     """)
     engine = get_engine()
@@ -1441,16 +1467,14 @@ def retrieve_topic_evidence_hits(
     search_phrases: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieve exact evidence rows using semantic + keyword search."""
-    merged: List[Dict[str, Any]] = []
     per_query_top_n = max(3, min(top_n, 4))
     if search_phrases:
         lexical_hits = retrieve_keyword_evidence_hits(
             search_phrases, nar_id, release_number, rtype, doc_id, top_n
         )
-        merged.extend(lexical_hits)
-        merged = _dedupe_evidence_hits(merged, limit=top_n)
-        if len(merged) >= top_n:
-            return merged
+        if lexical_hits:
+            return lexical_hits[:top_n]
+    merged: List[Dict[str, Any]] = []
     for query in queries:
         hits = retrieve_evidence_hits(
             query, nar_id, release_number, rtype, doc_id, per_query_top_n
@@ -1504,16 +1528,11 @@ def semantic_topic_match_strength(
             normalized_phrases.append(normalized)
     if any(phrase in joined for phrase in normalized_phrases):
         return "exact"
-    stop_words = {
-        "and", "the", "for", "with", "from", "into", "that", "this",
-        "have", "must", "good", "include", "table", "section", "application",
-        "overview", "details", "link", "keep", "applicable",
-    }
     evidence_token_set = set(_tokenize_match_text(" ".join(evidence_snippets)))
     semantic_tokens : List[str] = []
     for phrase in [semantic_tag] + [k for k in keywords if isinstance(k, str)]:
-        for token in _tokenize_match_text(phrase):
-            if len(token) > 4 and token not in stop_words and token not in semantic_tokens:
+        for token in _meaningful_match_tokens(phrase):
+            if token not in semantic_tokens:
                 semantic_tokens.append(token)
     if not semantic_tokens:
         return None
@@ -1591,6 +1610,55 @@ def should_promote_semantic_match(
             strong_keyword_hits += 1
 
     return strong_keyword_hits >= 2
+
+
+def _default_topic_justification(
+    tag: str,
+    status: str,
+    evidence_snippets: List[str],
+    is_diagram: bool = False,
+    diagram_refs: Optional[List[Dict[str, Any]]] = None,
+    topic_match: Optional[str] = None,
+    validation_error: Optional[str] = None,
+) -> str:
+    """Build a deterministic justification when model output omits one."""
+    diagram_refs = diagram_refs or []
+    evidence_count = sum(1 for snippet in evidence_snippets if (snippet or "").strip())
+
+    if is_diagram:
+        if diagram_refs:
+            message = (
+                f"Retrieved {len(diagram_refs)} diagram reference(s) for '{tag}', "
+                f"supporting status {status}."
+            )
+        elif evidence_count:
+            message = (
+                f"Retrieved {evidence_count} supporting text snippet(s) for '{tag}', "
+                "but no diagram reference was found."
+            )
+        else:
+            message = f"No diagram reference or supporting text was retrieved for '{tag}'."
+    elif status == "PRESENT":
+        if evidence_count:
+            message = f"Retrieved {evidence_count} supporting evidence snippet(s) for '{tag}'."
+        else:
+            message = f"'{tag}' was marked PRESENT, but the validator did not return a detailed explanation."
+    elif status == "PARTIAL":
+        if evidence_count:
+            message = (
+                f"Retrieved {evidence_count} supporting evidence snippet(s) for '{tag}', "
+                "but coverage appears incomplete."
+            )
+        else:
+            message = f"'{tag}' was marked PARTIAL without strong supporting evidence snippets."
+    else:
+        message = f"No supporting evidence was retrieved for '{tag}'."
+
+    if topic_match and not is_diagram:
+        message = message.rstrip(".") + f" Semantic match strength: {topic_match}."
+    if validation_error:
+        message = message.rstrip(".") + " Model fallback or parse recovery was used."
+    return message
 
 def pick_best_template_snippets_for_tag(
     tag_query: str,
@@ -1720,6 +1788,47 @@ def _evidence_hit_key(hit: Dict[str, Any]) -> str:
             _normalize_match_text(hit.get("chunk", "")),
         )
     )
+
+
+def _diagram_ref_search_text(ref: Dict[str, Any]) -> str:
+    """Build diagram reference text for matching and fallback checks."""
+    parts = [
+        ref.get("nearby_heading"),
+        ref.get("caption"),
+        ref.get("asset_label"),
+        ref.get("preceding_text"),
+        ref.get("page_text_excerpt"),
+        ref.get("doc_uri"),
+    ]
+    return " ".join(str(part or "") for part in parts if part)
+
+
+def _format_diagram_ref(ref: Dict[str, Any], max_len: int = 240) -> str:
+    """Render a diagram reference with nearby heading/context when available."""
+    parts: List[str] = []
+    nearby_heading = (ref.get("nearby_heading") or "").strip()
+    caption = (ref.get("caption") or "").strip()
+    asset_label = (ref.get("asset_label") or "").strip()
+    preceding_text = (ref.get("preceding_text") or "").strip()
+    page_num = _coerce_int(ref.get("page_num"))
+    doc_uri = (ref.get("doc_uri") or "").strip()
+
+    if nearby_heading:
+        parts.append(f"heading={nearby_heading}")
+    if caption and caption != nearby_heading:
+        parts.append(f"caption={caption}")
+    elif asset_label and asset_label not in {nearby_heading, caption}:
+        parts.append(f"asset={asset_label}")
+    if preceding_text and preceding_text not in {nearby_heading, caption}:
+        parts.append(f"context={preceding_text}")
+    if page_num is not None:
+        parts.append(f"page {page_num}")
+    if doc_uri:
+        parts.append(doc_uri)
+
+    rendered = " | ".join(part for part in parts if part)
+    fallback = caption or asset_label or doc_uri or "(diagram reference)"
+    return _truncate_text(rendered or fallback, max_len)
 
 
 def _dedupe_evidence_hits(
@@ -2101,7 +2210,7 @@ def retrieve_mm_diagrams(
     doc_id: Optional[str],
     top_n: int = 3,
     dim: int = MM_DIM,
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """Retrieve multimodal diagram references."""
     qv = mm_embed_text(query_text, dim)
     vec = _vec_literal(qv)
@@ -2117,7 +2226,7 @@ def retrieve_mm_diagrams(
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
     sql = text(f"""
-        SELECT caption, doc_uri
+        SELECT caption, doc_uri, page_num, metadata
         FROM {TABLE_MM_EVID}
         WHERE {" AND ".join(where)}
         ORDER BY embedding <-> CAST(:vec AS vector)
@@ -2126,7 +2235,19 @@ def retrieve_mm_diagrams(
     engine = get_engine()
     with engine.connect() as c:
         rows = c.execute(sql, params).fetchall()
-    return [{"caption": r[0], "doc_uri": r[1]} for r in rows]
+    diagram_refs: List[Dict[str, Any]] = []
+    for row in rows:
+        metadata = _parse_jsonish_dict(_row_value(row, "metadata", {}))
+        diagram_refs.append({
+            "caption": _row_value(row, "caption", "") or "",
+            "doc_uri": _row_value(row, "doc_uri", "") or "",
+            "page_num": _coerce_int(_row_value(row, "page_num")),
+            "asset_label": metadata.get("asset_label"),
+            "nearby_heading": metadata.get("nearby_heading"),
+            "preceding_text": metadata.get("preceding_text"),
+            "page_text_excerpt": metadata.get("page_text_excerpt"),
+        })
+    return diagram_refs
 
 
 def retrieve_mm_diagrams_safe(
@@ -2137,7 +2258,7 @@ def retrieve_mm_diagrams_safe(
     doc_id: Optional[str],
     top_n: int = 3,
     dim: int = MM_DIM,
-) -> List[Dict[str, str]]:
+) -> List[Dict[str, Any]]:
     """Best-effort multimodal retrieval that degrades to text-only validation."""
     try:
         return retrieve_mm_diagrams(
@@ -2443,7 +2564,7 @@ def run_validation(
                 dim=MM_DIM,
             )
             diag_lines = [
-                _truncate_text(f"{hit['caption']}: {hit['doc_uri']}", 260)
+                _format_diagram_ref(hit, max_len=260)
                 for hit in mm_hits
             ]
             diag_block = "\n".join(line for line in diag_lines if line) or "(none)"
@@ -2607,7 +2728,7 @@ def run_validation(
             ev_snips,
         )
         topic_alignment = topic_alignment_status(tag, semantic_tag, ev_snips)
-        promote_semantic_match = should_promote_semantic_match(
+        promote_semantic_match = (not is_diagram) and should_promote_semantic_match(
             topic_match=topic_match,
             topic_alignment=topic_alignment,
             keywords=combined_match_terms,
@@ -2635,6 +2756,21 @@ def run_validation(
             if not isinstance(result_citations, dict):
                 result_citations = {}
 
+        if status == "PRESENT" and not ev_snips and not mm_hits:
+            status = "MISSING"
+            justification = f"No supporting evidence was retrieved for '{tag}'."
+
+        if is_diagram and not mm_hits:
+            if ev_snips:
+                status = "PARTIAL"
+                justification = (
+                    f"Supporting text was retrieved for '{tag}', but no diagram reference or image match was found, "
+                    "so the diagram requirement remains PARTIAL."
+                )
+            else:
+                status = "MISSING"
+                justification = f"No diagram reference or supporting text was retrieved for '{tag}'."
+
         if tag_1 in ("0.1 nar id", "8.1 nar id", "nar id") and nar_id:
             status = "PRESENT"
             justification = f"NAR ID '{nar_id}' was resolved from evidence."
@@ -2651,6 +2787,20 @@ def run_validation(
         if tag_1 in ("0.3 r-type", "0.3 r type", "r-type", "r type", "rtype") and rtype:
             status = "PRESENT"
             justification = f"R-Type '{rtype}' was provided for validation."
+
+        if not isinstance(justification, str):
+            justification = ""
+        justification = justification.strip()
+        if not justification:
+            justification = _default_topic_justification(
+                tag=tag,
+                status=status,
+                evidence_snippets=ev_snips,
+                is_diagram=is_diagram,
+                diagram_refs=mm_hits,
+                topic_match=topic_match,
+                validation_error=result_validation_error,
+            )
 
         results.append({
             "intent": intent_name,
