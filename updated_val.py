@@ -834,7 +834,41 @@ def read_pdf_text(pdf_path: str) -> str:
                     lines.append(" ".join(spans))
             if lines:
                 rendered_blocks.append("\n".join(lines))
+
+        normalized_page_text = _normalize_pdf_line("\n\n".join(rendered_blocks))
+        for table_text in _extract_fitz_table_texts(page):
+            normalized_table_text = _normalize_pdf_line(table_text)
+            if not normalized_table_text or normalized_table_text in normalized_page_text:
+                continue
+            rendered_blocks.append("TABLE\n" + table_text)
+            normalized_page_text = _normalize_pdf_line("\n\n".join(rendered_blocks))
         return "\n\n".join(rendered_blocks).strip()
+
+    def _extract_fitz_table_texts(page: Any) -> List[str]:
+        if not hasattr(page, "find_tables"):
+            return []
+        try:
+            table_result = page.find_tables()
+        except Exception:
+            return []
+
+        tables = getattr(table_result, "tables", table_result) or []
+        extracted_tables: List[str] = []
+        for table in tables:
+            try:
+                rows = table.extract() or []
+            except Exception:
+                continue
+            rendered_rows: List[str] = []
+            for row in rows:
+                if not isinstance(row, (list, tuple)):
+                    continue
+                cells = [_normalize_pdf_line(cell or "") for cell in row]
+                if any(cells):
+                    rendered_rows.append(" | ".join(cells))
+            if rendered_rows:
+                extracted_tables.append("\n".join(rendered_rows))
+        return extracted_tables
 
     def _normalized_text_length(text_in: str) -> int:
         return len(re.sub(r"\s+", "", (text_in or "").strip()))
@@ -1880,6 +1914,93 @@ def _format_diagram_ref(ref: Dict[str, Any], max_len: int = 240) -> str:
     return _truncate_text(rendered or fallback, max_len)
 
 
+def _diagram_ref_key(ref: Dict[str, Any]) -> str:
+    """Build a stable key for de-duplicating diagram references."""
+    return "|".join(
+        str(value or "")
+        for value in (
+            ref.get("doc_uri"),
+            ref.get("page_num"),
+            ref.get("asset_label") or ref.get("caption"),
+        )
+    )
+
+
+def _dedupe_diagram_refs(
+    refs: List[Dict[str, Any]],
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Keep diagram refs unique by location/asset identity."""
+    deduped: List[Dict[str, Any]] = []
+    seen = set()
+    for ref in refs:
+        key = _diagram_ref_key(ref)
+        if not key or key in seen:
+            continue
+        seen.add(key)
+        deduped.append(ref)
+        if limit is not None and len(deduped) >= limit:
+            break
+    return deduped
+
+
+def _diagram_ref_match_strength(
+    semantic_tag: str,
+    keywords: List[str],
+    ref: Dict[str, Any],
+) -> Optional[str]:
+    """Assess whether a diagram reference is textually aligned to the topic."""
+    search_text = _diagram_ref_search_text(ref)
+    normalized_search_text = _normalize_match_text(search_text)
+    if not normalized_search_text:
+        return None
+
+    candidate_phrases = [semantic_tag] + [k for k in keywords if isinstance(k, str)]
+    normalized_candidates: List[str] = []
+    for phrase in candidate_phrases:
+        normalized_phrase = _normalize_match_text(phrase)
+        if normalized_phrase and len(normalized_phrase) >= 4:
+            normalized_candidates.append(normalized_phrase)
+    if any(phrase in normalized_search_text for phrase in normalized_candidates):
+        return "exact"
+
+    search_tokens = set(_tokenize_match_text(search_text))
+    for phrase in candidate_phrases:
+        phrase_tokens = _meaningful_match_tokens(phrase)
+        if not phrase_tokens:
+            continue
+        token_hits = sum(1 for token in phrase_tokens if token in search_tokens)
+        required_hits = 1 if len(phrase_tokens) == 1 else min(
+            len(phrase_tokens),
+            max(2, (len(phrase_tokens) + 1) // 2),
+        )
+        if token_hits >= required_hits:
+            return "partial"
+    return None
+
+
+def _filter_diagram_refs_for_topic(
+    refs: List[Dict[str, Any]],
+    semantic_tag: str,
+    keywords: List[str],
+    limit: Optional[int] = None,
+) -> List[Dict[str, Any]]:
+    """Keep only diagram refs whose caption/heading context matches the topic."""
+    filtered: List[Dict[str, Any]] = []
+    normalized_topic = _normalize_line_text(semantic_tag)
+    for ref in refs:
+        match_strength = _diagram_ref_match_strength(semantic_tag, keywords, ref)
+        nearby_heading = _normalize_line_text(str(ref.get("nearby_heading") or ""))
+        if not match_strength and not (
+            normalized_topic and nearby_heading and normalized_topic in nearby_heading
+        ):
+            continue
+        enriched = dict(ref)
+        enriched["match_strength"] = match_strength
+        filtered.append(enriched)
+    return _dedupe_diagram_refs(filtered, limit=limit)
+
+
 def _dedupe_evidence_hits(
     hits: List[Dict[str, Any]],
     limit: Optional[int] = None,
@@ -2251,6 +2372,101 @@ def retrieve_guidance_snippets(
         return []
 
 
+def _build_diagram_ref(row: Any) -> Dict[str, Any]:
+    """Normalize a retrieved diagram row into a context-rich dict."""
+    metadata = _parse_jsonish_dict(_row_value(row, "metadata", {}))
+    return {
+        "caption": _row_value(row, "caption", "") or "",
+        "doc_uri": _row_value(row, "doc_uri", "") or "",
+        "page_num": _coerce_int(_row_value(row, "page_num")),
+        "distance": _coerce_float(_row_value(row, "distance")),
+        "score": _coerce_float(_row_value(row, "score")),
+        "asset_label": metadata.get("asset_label"),
+        "nearby_heading": metadata.get("nearby_heading"),
+        "preceding_text": metadata.get("preceding_text"),
+        "page_text_excerpt": metadata.get("page_text_excerpt"),
+    }
+
+
+def retrieve_keyword_diagram_refs(
+    phrases: List[str],
+    nar_id: str,
+    release_number: str,
+    rtype: str,
+    doc_id: Optional[str],
+    top_n: int,
+) -> List[Dict[str, Any]]:
+    """Retrieve diagram refs using lexical matching across caption and stored context metadata."""
+    valid_phrases = []
+    seen = set()
+    for phrase in phrases:
+        normalized = _normalize_match_text(phrase)
+        if normalized and normalized not in seen:
+            seen.add(normalized)
+            valid_phrases.append((phrase, normalized))
+    if not valid_phrases:
+        return []
+
+    where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype"]
+    params: Dict[str, Any] = {
+        "nar": nar_id,
+        "rel": release_number,
+        "rtype": rtype,
+        "topn": top_n,
+    }
+    if doc_id:
+        where.append("doc_id=:doc_id")
+        params["doc_id"] = doc_id
+
+    search_expr = (
+        "COALESCE(caption, '') || ' ' || "
+        "COALESCE(metadata->>'nearby_heading', '') || ' ' || "
+        "COALESCE(metadata->>'preceding_text', '') || ' ' || "
+        "COALESCE(metadata->>'page_text_excerpt', '') || ' ' || "
+        "COALESCE(metadata->>'asset_label', '')"
+    )
+    phrase_conditions = []
+    score_terms = []
+    for idx, (raw_phrase, normalized_phrase) in enumerate(valid_phrases):
+        like_key = f"d_phrase_{idx}"
+        exact_key = f"d_exact_{idx}"
+        params[like_key] = f"%{raw_phrase}%"
+        params[exact_key] = f"%{normalized_phrase}%"
+        phrase_conditions.append(f"({search_expr}) ILIKE :{like_key}")
+        score_terms.append(
+            f"CASE WHEN lower(regexp_replace(({search_expr}), '[^a-zA-Z0-9]', '', 'g')) LIKE :{exact_key} THEN 8 ELSE 0 END"
+        )
+        score_terms.append(f"CASE WHEN ({search_expr}) ILIKE :{like_key} THEN 6 ELSE 0 END")
+
+        phrase_tokens = _meaningful_match_tokens(raw_phrase, min_length=4)
+        if phrase_tokens:
+            token_score_terms = []
+            for token_idx, token in enumerate(phrase_tokens[:5]):
+                token_key = f"d_token_{idx}_{token_idx}"
+                params[token_key] = f"%{token}%"
+                token_score_terms.append(f"CASE WHEN ({search_expr}) ILIKE :{token_key} THEN 1 ELSE 0 END")
+            token_score_expr = " + ".join(token_score_terms)
+            required_hits = 1 if len(phrase_tokens) == 1 else min(3, max(2, (len(phrase_tokens) + 1) // 2))
+            phrase_conditions.append(f"(({token_score_expr}) >= {required_hits})")
+            score_terms.append(f"({token_score_expr})")
+
+    lexical_score_sql = " + ".join(score_terms) if score_terms else "0"
+    sql = text(f"""
+        SELECT caption, doc_uri, page_num, metadata,
+               ({lexical_score_sql}) AS score
+        FROM {TABLE_MM_EVID}
+        WHERE {" AND ".join(where)}
+          AND ({" OR ".join(phrase_conditions)})
+        ORDER BY score DESC, COALESCE(page_num, 0), caption
+        LIMIT :topn
+    """)
+    engine = get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+    refs = [_build_diagram_ref(row) for row in rows]
+    return _dedupe_diagram_refs(refs, limit=top_n)
+
+
 def retrieve_mm_diagrams(
     query_text: str,
     nar_id: str,
@@ -2259,8 +2475,25 @@ def retrieve_mm_diagrams(
     doc_id: Optional[str],
     top_n: int = 3,
     dim: int = MM_DIM,
+    search_phrases: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Retrieve multimodal diagram references."""
+    merged: List[Dict[str, Any]] = []
+    if search_phrases:
+        merged.extend(
+            retrieve_keyword_diagram_refs(
+                search_phrases,
+                nar_id,
+                release_number,
+                rtype,
+                doc_id,
+                top_n,
+            )
+        )
+        merged = _dedupe_diagram_refs(merged, limit=top_n)
+        if len(merged) >= top_n:
+            return merged
+
     qv = mm_embed_text(query_text, dim)
     vec = _vec_literal(qv)
     where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype"]
@@ -2275,28 +2508,18 @@ def retrieve_mm_diagrams(
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
     sql = text(f"""
-        SELECT caption, doc_uri, page_num, metadata
+        SELECT caption, doc_uri, page_num, metadata,
+               embedding <-> CAST(:vec AS vector) AS distance
         FROM {TABLE_MM_EVID}
         WHERE {" AND ".join(where)}
-        ORDER BY embedding <-> CAST(:vec AS vector)
+        ORDER BY distance
         LIMIT :topn
     """)
     engine = get_engine()
     with engine.connect() as c:
         rows = c.execute(sql, params).fetchall()
-    diagram_refs: List[Dict[str, Any]] = []
-    for row in rows:
-        metadata = _parse_jsonish_dict(_row_value(row, "metadata", {}))
-        diagram_refs.append({
-            "caption": _row_value(row, "caption", "") or "",
-            "doc_uri": _row_value(row, "doc_uri", "") or "",
-            "page_num": _coerce_int(_row_value(row, "page_num")),
-            "asset_label": metadata.get("asset_label"),
-            "nearby_heading": metadata.get("nearby_heading"),
-            "preceding_text": metadata.get("preceding_text"),
-            "page_text_excerpt": metadata.get("page_text_excerpt"),
-        })
-    return diagram_refs
+    merged.extend(_build_diagram_ref(row) for row in rows)
+    return _dedupe_diagram_refs(merged, limit=top_n)
 
 
 def retrieve_mm_diagrams_safe(
@@ -2307,6 +2530,7 @@ def retrieve_mm_diagrams_safe(
     doc_id: Optional[str],
     top_n: int = 3,
     dim: int = MM_DIM,
+    search_phrases: Optional[List[str]] = None,
 ) -> List[Dict[str, Any]]:
     """Best-effort multimodal retrieval that degrades to text-only validation."""
     try:
@@ -2318,6 +2542,7 @@ def retrieve_mm_diagrams_safe(
             doc_id=doc_id,
             top_n=top_n,
             dim=dim,
+            search_phrases=search_phrases,
         )
     except Exception as exc:
         logging.warning(
@@ -2603,7 +2828,7 @@ def run_validation(
 
         mm_hits: List[Dict[str, str]] = []
         if enable_mm and is_diagram:
-            mm_hits = retrieve_mm_diagrams_safe(
+            mm_candidate_hits = retrieve_mm_diagrams_safe(
                 query_full,
                 nar_id,
                 release_number,
@@ -2611,6 +2836,13 @@ def run_validation(
                 effective_doc_id,
                 top_n=3,
                 dim=MM_DIM,
+                search_phrases=topic_search_phrases,
+            )
+            mm_hits = _filter_diagram_refs_for_topic(
+                mm_candidate_hits,
+                semantic_tag=semantic_tag,
+                keywords=[term for term in combined_match_terms if isinstance(term, str)],
+                limit=3,
             )
             diag_lines = [
                 _format_diagram_ref(hit, max_len=260)
@@ -2891,6 +3123,14 @@ def run_validation(
             effective_doc_id,
             top_n=4,
             dim=MM_DIM,
+            search_phrases=[
+                "overall architecture",
+                "conceptual architecture",
+                "logical architecture",
+                "physical architecture",
+                "deployment topology",
+                "interfaces diagram",
+            ],
         )
         if enable_mm
         else []
