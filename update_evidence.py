@@ -640,6 +640,14 @@ def _render_pdf_structured_page_text(page: Any) -> str:
         if not lines:
             continue
         rendered_blocks.append("\n".join(lines))
+
+    normalized_page_text = _normalize_context_text("\n\n".join(rendered_blocks))
+    for table_text in _extract_pdf_table_texts(page):
+        normalized_table_text = _normalize_context_text(table_text)
+        if not normalized_table_text or normalized_table_text in normalized_page_text:
+            continue
+        rendered_blocks.append("TABLE\n" + table_text)
+        normalized_page_text = _normalize_context_text("\n\n".join(rendered_blocks))
     return "\n\n".join(rendered_blocks).strip()
 
 
@@ -665,6 +673,34 @@ def _choose_pdf_page_text(
     if fitz_plain_len:
         return fitz_plain_text, "pymupdf", PYMUPDF_VERSION
     return "", "", None
+
+
+def _extract_pdf_table_texts(page: Any) -> List[str]:
+    """Extract table rows when PyMuPDF table detection is available."""
+    if not hasattr(page, "find_tables"):
+        return []
+    try:
+        table_result = page.find_tables()
+    except Exception:
+        return []
+
+    tables = getattr(table_result, "tables", table_result) or []
+    extracted_tables: List[str] = []
+    for table in tables:
+        try:
+            rows = table.extract() or []
+        except Exception:
+            continue
+        rendered_rows: List[str] = []
+        for row in rows:
+            if not isinstance(row, (list, tuple)):
+                continue
+            cells = [_normalize_context_text(cell or "") for cell in row]
+            if any(cells):
+                rendered_rows.append(" | ".join(cells))
+        if rendered_rows:
+            extracted_tables.append("\n".join(rendered_rows))
+    return extracted_tables
 
 
 def resolve_rtype(user_val: str) -> str:
