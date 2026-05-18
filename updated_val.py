@@ -809,9 +809,39 @@ def generate_architecture_summary_json(
 # ============================================================================
 
 def read_pdf_text(pdf_path: str) -> str:
-    """Extract text from PDF file."""
+    """Extract text from PDF file while preserving layout structure when possible."""
+    def _normalize_pdf_line(text_in: str) -> str:
+        return re.sub(r"\s+", " ", (text_in or "").replace("\x00", " ")).strip()
+
+    def _extract_fitz_structured_page_text(page: Any) -> str:
+        try:
+            blocks = (page.get_text("dict", sort=True) or {}).get("blocks") or []
+        except Exception:
+            return ""
+
+        rendered_blocks: List[str] = []
+        for block in blocks:
+            if block.get("type") != 0:
+                continue
+            lines: List[str] = []
+            for line in block.get("lines") or []:
+                spans: List[str] = []
+                for span in line.get("spans") or []:
+                    span_text = _normalize_pdf_line(span.get("text", ""))
+                    if span_text:
+                        spans.append(span_text)
+                if spans:
+                    lines.append(" ".join(spans))
+            if lines:
+                rendered_blocks.append("\n".join(lines))
+        return "\n\n".join(rendered_blocks).strip()
+
+    def _normalized_text_length(text_in: str) -> int:
+        return len(re.sub(r"\s+", "", (text_in or "").strip()))
+
     pypdf_pages: List[str] = []
-    fitz_pages: List[str] = []
+    fitz_structured_pages: List[str] = []
+    fitz_plain_pages: List[str] = []
 
     try:
         reader = PdfReader(pdf_path)
@@ -823,24 +853,43 @@ def read_pdf_text(pdf_path: str) -> str:
         import fitz  # PyMuPDF
         fitz_doc = fitz.open(pdf_path)
         try:
-            fitz_pages = [(page.get_text("text") or "") for page in fitz_doc]
+            fitz_structured_pages = []
+            fitz_plain_pages = []
+            for page_index in range(len(fitz_doc)):
+                page = fitz_doc.load_page(page_index)
+                fitz_structured_pages.append(_extract_fitz_structured_page_text(page))
+                fitz_plain_pages.append(page.get_text("text") or "")
         finally:
             fitz_doc.close()
     except Exception as exc:
         if not pypdf_pages:
             logging.warning(f"PyMuPDF failed to extract text from '{pdf_path}': {exc}")
 
-    if not pypdf_pages and not fitz_pages:
+    if not pypdf_pages and not fitz_structured_pages and not fitz_plain_pages:
         logging.error(f"Both PyPDF2 and PyMuPDF failed to extract text from '{pdf_path}'. Returning empty string.")
         return ""
 
     merged_pages: List[str] = []
-    for index in range(max(len(pypdf_pages), len(fitz_pages))):
+    page_count = max(len(pypdf_pages), len(fitz_structured_pages), len(fitz_plain_pages))
+    for index in range(page_count):
         pypdf_text = pypdf_pages[index] if index < len(pypdf_pages) else ""
-        fitz_text = fitz_pages[index] if index < len(fitz_pages) else ""
-        chosen = fitz_text if len(fitz_text.strip()) > len(pypdf_text.strip()) else pypdf_text
-        merged_pages.append(chosen)
-    return "\n".join(merged_pages)
+        fitz_structured_text = fitz_structured_pages[index] if index < len(fitz_structured_pages) else ""
+        fitz_plain_text = fitz_plain_pages[index] if index < len(fitz_plain_pages) else ""
+
+        structured_len = _normalized_text_length(fitz_structured_text)
+        pypdf_len = _normalized_text_length(pypdf_text)
+        fitz_plain_len = _normalized_text_length(fitz_plain_text)
+
+        if structured_len and (pypdf_len == 0 or structured_len >= max(80, int(pypdf_len * 0.6))):
+            chosen = fitz_structured_text
+        elif fitz_plain_len > pypdf_len:
+            chosen = fitz_plain_text
+        else:
+            chosen = pypdf_text
+
+        if chosen.strip():
+            merged_pages.append(chosen)
+    return "\n\n".join(merged_pages)
 
 
 def read_docx_text(docx_path: str) -> str:
