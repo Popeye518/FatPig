@@ -868,6 +868,12 @@ def compute_doc_hash(file_bytes: bytes) -> str:
     return hashlib.sha256(file_bytes).hexdigest()
 
 
+def compute_doc_id_from_file(file_path: str) -> str:
+    """Compute evidence doc_id from the same file bytes used during ingestion."""
+    with open(file_path, "rb") as evidence_file:
+        return compute_doc_hash(evidence_file.read())
+
+
 def split_text_local(
     text_in: str,
     chunk_size: int = 900,
@@ -1101,6 +1107,25 @@ def _resolve_validation_scope_label(
     if min_doc_id and max_doc_id and min_doc_id == max_doc_id:
         return str(min_doc_id)
     return f"ALL_MATCHING_DOCUMENTS ({doc_count} doc_ids)"
+
+
+def _resolve_unique_doc_id_from_db_scope(
+    nar_id: str,
+    release_number: str,
+    rtype: str,
+) -> Optional[str]:
+    """Return the only matching doc_id for the current DB scope when it is unambiguous."""
+    scope_label = _resolve_validation_scope_label(
+        nar_id=nar_id,
+        release_number=release_number,
+        rtype=rtype,
+        explicit_doc_id=None,
+    )
+    if not scope_label or scope_label in {"NO_MATCHING_DOCUMENTS"}:
+        return None
+    if scope_label.startswith("ALL_MATCHING_DOCUMENTS"):
+        return None
+    return scope_label
 
 
 def _build_architecture_fallback(
@@ -3173,12 +3198,21 @@ def main():
     ap.add_argument("--release-number", required=True)
     ap.add_argument("--rtype", required=True, help="indev | new | migration | rehost | normal")
     ap.add_argument("--top-k", type=int, default=6, help="Top-K evidence text chunks per tag")
-    ap.add_argument("--scope-doc-id", default="", help="Optional: restrict validation to a specific evidence doc_id")
+    ap.add_argument(
+        "--scope-doc-id",
+        default="",
+        help="Optional: restrict validation to a specific evidence doc_id. If omitted, validator auto-uses the only matching doc_id for the current NAR/release/rtype when unambiguous.",
+    )
     ap.add_argument("--scope-doc-hash", default="", help="Deprecated alias for --scope-doc-id")
+    ap.add_argument(
+        "--scope-doc-file",
+        default="",
+        help="Optional: derive doc_id by hashing this evidence file with the same SHA-256 logic used during ingestion.",
+    )
     ap.add_argument(
         "--export-source-doc-id",
         default="",
-        help="Optional: export canonical source text for this evidence doc_id (defaults to --scope-doc-id when set).",
+        help="Optional: export canonical source text for this evidence doc_id (defaults to the resolved validation scope doc_id when available).",
     )
     ap.add_argument(
         "--export-source-out",
@@ -3198,12 +3232,48 @@ def main():
     get_engine()
     validate_runtime_contract(MM_DIM if args.enable_mm else 0)
 
-    scope_doc_id = args.scope_doc_id.strip() or args.scope_doc_hash.strip() or None
+    scope_doc_file = args.scope_doc_file.strip()
+    derived_scope_doc_id: Optional[str] = None
+    if scope_doc_file:
+        if not os.path.isfile(scope_doc_file):
+            raise SystemExit(f"ERROR: --scope-doc-file does not exist: {scope_doc_file}")
+        derived_scope_doc_id = compute_doc_id_from_file(scope_doc_file)
+        logging.info(
+            "Derived doc_id from scope file '%s': %s",
+            scope_doc_file,
+            derived_scope_doc_id,
+        )
+
+    explicit_scope_doc_id = args.scope_doc_id.strip() or args.scope_doc_hash.strip()
+    if explicit_scope_doc_id and derived_scope_doc_id and explicit_scope_doc_id != derived_scope_doc_id:
+        raise SystemExit(
+            "ERROR: --scope-doc-id/--scope-doc-hash does not match the doc_id derived from --scope-doc-file."
+        )
+
+    auto_scope_doc_id = None
+    if not explicit_scope_doc_id and not derived_scope_doc_id:
+        auto_scope_doc_id = _resolve_unique_doc_id_from_db_scope(
+            nar_id=args.nar_id,
+            release_number=args.release_number,
+            rtype=rtype,
+        )
+
+    scope_doc_id = explicit_scope_doc_id or derived_scope_doc_id or auto_scope_doc_id or None
     if args.scope_doc_hash.strip() and not args.scope_doc_id.strip():
         logging.warning("--scope-doc-hash is deprecated; use --scope-doc-id instead.")
 
-    if scope_doc_id:
+    if explicit_scope_doc_id:
         logging.info(f"Using explicit doc_id scope: {scope_doc_id}")
+    elif derived_scope_doc_id:
+        logging.info(f"Using doc_id derived from scope file: {scope_doc_id}")
+    elif auto_scope_doc_id:
+        logging.info(
+            "Auto-resolved unique doc_id from database scope for nar_id='%s', release_number='%s', rtype='%s': %s",
+            args.nar_id,
+            args.release_number,
+            rtype,
+            scope_doc_id,
+        )
     else:
         logging.info(
             "No doc_id scope provided; validating across matching evidence for the selected NAR/release/rtype."
@@ -3215,7 +3285,7 @@ def main():
     export_source_doc_id = args.export_source_doc_id.strip() or scope_doc_id
     if export_source_requested and not export_source_doc_id:
         raise SystemExit(
-            "ERROR: --export-source-doc-id is required for canonical source export unless --scope-doc-id is set."
+            "ERROR: --export-source-doc-id is required for canonical source export unless --scope-doc-id, --scope-doc-file, or the current NAR/release/rtype resolves to exactly one doc_id."
         )
 
     result = run_validation(
