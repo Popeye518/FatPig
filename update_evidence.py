@@ -618,6 +618,55 @@ def _build_image_context_caption(
     return _truncate_context_text(" | ".join(caption_parts), 220)
 
 
+def _render_pdf_structured_page_text(page: Any) -> str:
+    """Render page text from ordered PyMuPDF blocks while preserving layout boundaries."""
+    try:
+        blocks = (page.get_text("dict", sort=True) or {}).get("blocks") or []
+    except Exception:
+        return ""
+
+    rendered_blocks: List[str] = []
+    for block in blocks:
+        if block.get("type") != 0:
+            continue
+        block_text = _extract_pdf_text_block_text(block)
+        if not block_text:
+            continue
+        lines = [
+            _normalize_context_text(line)
+            for line in re.split(r"\r?\n", block_text)
+        ]
+        lines = [line for line in lines if line]
+        if not lines:
+            continue
+        rendered_blocks.append("\n".join(lines))
+    return "\n\n".join(rendered_blocks).strip()
+
+
+def _normalized_text_length(text_in: str) -> int:
+    """Measure extracted text content after normalization for extractor selection."""
+    return len(re.sub(r"\s+", "", (text_in or "").strip()))
+
+
+def _choose_pdf_page_text(
+    pypdf_text: str,
+    fitz_structured_text: str,
+    fitz_plain_text: str,
+) -> Tuple[str, str, Optional[str]]:
+    """Choose the best page text candidate while preferring structured layout output."""
+    structured_len = _normalized_text_length(fitz_structured_text)
+    pypdf_len = _normalized_text_length(pypdf_text)
+    fitz_plain_len = _normalized_text_length(fitz_plain_text)
+
+    if structured_len and (pypdf_len == 0 or structured_len >= max(80, int(pypdf_len * 0.6))):
+        return fitz_structured_text, "pymupdf-layout", PYMUPDF_VERSION
+    if pypdf_len >= fitz_plain_len and pypdf_len:
+        return pypdf_text, "pypdf2", PYPDF2_VERSION
+    if fitz_plain_len:
+        return fitz_plain_text, "pymupdf", PYMUPDF_VERSION
+    return "", "", None
+
+
 def resolve_rtype(user_val: str) -> str:
     """Maps user-provided shorthand to canonical rtype string.
     
@@ -1120,36 +1169,58 @@ def compute_doc_uri(
 def pdf_pages_text(pdf_path: str) -> List[ExtractedTextSource]:
     """Extract text from PDF by page."""
     pages: List[ExtractedTextSource] = []
-    reader = PdfReader(pdf_path)
-    fitz_doc = fitz.open(pdf_path)  # for image extraction later
-    page_count = max(len(reader.pages), len(fitz_doc))
+    reader: Optional[PdfReader] = None
+    fitz_doc = None
+    try:
+        reader = PdfReader(pdf_path)
+    except Exception as exc:
+        logging.debug(f"[PDF][TEXT] PyPDF2 failed to open '{pdf_path}': {exc}")
+    try:
+        fitz_doc = fitz.open(pdf_path)
+    except Exception as exc:
+        logging.debug(f"[PDF][TEXT] PyMuPDF failed to open '{pdf_path}': {exc}")
+
+    if reader is None and fitz_doc is None:
+        return pages
+
+    page_count = max(
+        len(reader.pages) if reader is not None else 0,
+        len(fitz_doc) if fitz_doc is not None else 0,
+    )
     for i in range(page_count):
         pypdf_text = ""
+        fitz_structured_text = ""
         fitz_text = ""
-        if i < len(reader.pages):
+        if reader is not None and i < len(reader.pages):
             try:
                 pypdf_text = reader.pages[i].extract_text() or ""
             except Exception as exc:
                 logging.debug(f"[PDF][TEXT] PyPDF2 failed to extract text from page {i+1} of '{pdf_path}': {exc}")
-        if i < len(fitz_doc):
+        if fitz_doc is not None and i < len(fitz_doc):
             try:
-                fitz_text = fitz_doc.load_page(i).get_text("text") or ""
+                fitz_page = fitz_doc.load_page(i)
+                fitz_structured_text = _render_pdf_structured_page_text(fitz_page)
+                fitz_text = fitz_page.get_text("text") or ""
             except Exception as exc:
                 logging.debug(f"[PDF][TEXT] PyMuPDF failed to extract text from page {i+1} of '{pdf_path}': {exc}")
 
-        use_pypdf = len(pypdf_text) >= len(fitz_text)
-        chosen_text = pypdf_text if use_pypdf else fitz_text
+        chosen_text, extractor_name, parser_version = _choose_pdf_page_text(
+            pypdf_text,
+            fitz_structured_text,
+            fitz_text,
+        )
         if chosen_text and chosen_text.strip():
             pages.append(
                 ExtractedTextSource(
                     text_scope="page",
                     page_num=i + 1,
                     text=chosen_text,
-                    extractor_name="pypdf2" if use_pypdf else "pymupdf",
-                    parser_version=PYPDF2_VERSION if use_pypdf else PYMUPDF_VERSION,
+                    extractor_name=extractor_name,
+                    parser_version=parser_version,
                 )
             )
-    fitz_doc.close()
+    if fitz_doc is not None:
+        fitz_doc.close()
     return pages
 
 
