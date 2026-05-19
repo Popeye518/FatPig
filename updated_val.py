@@ -1469,6 +1469,32 @@ def build_topic_search_phrases(
     return phrases
 
 
+def _is_diagram_like_topic(
+    tag: str,
+    semantic_tag: str,
+    notes: str,
+    conds: str,
+    keywords: List[str],
+) -> bool:
+    """Identify topics that should search the diagram lane.
+
+    Many architecture requirements do not literally say "diagram" in the tag even
+    though the expected evidence is an architecture view or figure.
+    """
+    fields = [tag, semantic_tag, notes, conds] + [k for k in keywords if isinstance(k, str)]
+    lowered = " \n".join((field or "").lower() for field in fields)
+    if "diagram" in lowered:
+        return True
+
+    has_architecture_family = bool(
+        re.search(r"\b(?:architecture|arch|topology|deployment)\b", lowered)
+    )
+    has_view_hint = bool(
+        re.search(r"\b(?:logical|physical|conceptual|interface|network|infra|infrastructure|view)\b", lowered)
+    )
+    return has_architecture_family and has_view_hint
+
+
 def retrieve_keyword_evidence_hits(
     phrases: List[str],
     nar_id: str,
@@ -2435,8 +2461,10 @@ def _build_diagram_ref(row: Any) -> Dict[str, Any]:
     metadata = _parse_jsonish_dict(_row_value(row, "metadata", {}))
     return {
         "caption": _row_value(row, "caption", "") or "",
+        "doc_id": _row_value(row, "doc_id"),
         "doc_uri": _row_value(row, "doc_uri", "") or "",
         "page_num": _coerce_int(_row_value(row, "page_num")),
+        "chunk_index": _coerce_int(_row_value(row, "chunk_index")),
         "distance": _coerce_float(_row_value(row, "distance")),
         "score": _coerce_float(_row_value(row, "score")),
         "asset_label": metadata.get("asset_label"),
@@ -2444,6 +2472,112 @@ def _build_diagram_ref(row: Any) -> Dict[str, Any]:
         "preceding_text": metadata.get("preceding_text"),
         "page_text_excerpt": metadata.get("page_text_excerpt"),
     }
+
+
+def _evidence_anchor_doc(hit: Dict[str, Any]) -> Optional[Tuple[str, str]]:
+    """Return the strongest document anchor available from an evidence hit."""
+    doc_id = str(hit.get("doc_id") or "").strip()
+    doc_uri = str(hit.get("doc_uri") or "").strip()
+    if doc_id:
+        return ("doc_id", doc_id)
+    if doc_uri:
+        return ("doc_uri", doc_uri)
+    return None
+
+
+def _build_evidence_page_window(
+    evidence_hits: List[Dict[str, Any]],
+    page_padding: int = 1,
+    max_pages: int = 8,
+) -> Tuple[Optional[Tuple[str, str]], List[int]]:
+    """Build a document/page anchor from topic evidence hits."""
+    if not evidence_hits:
+        return None, []
+
+    anchor = None
+    for hit in evidence_hits:
+        anchor = _evidence_anchor_doc(hit)
+        if anchor:
+            break
+
+    page_candidates: List[int] = []
+    for hit in evidence_hits:
+        if anchor is not None:
+            anchor_kind, anchor_value = anchor
+            hit_anchor = _evidence_anchor_doc(hit)
+            if hit_anchor != (anchor_kind, anchor_value):
+                continue
+        page_num = _coerce_int(hit.get("page_num"))
+        if page_num is None:
+            continue
+        for candidate in range(max(1, page_num - page_padding), page_num + page_padding + 1):
+            if candidate not in page_candidates:
+                page_candidates.append(candidate)
+            if len(page_candidates) >= max_pages:
+                return anchor, sorted(page_candidates)
+    return anchor, sorted(page_candidates)
+
+
+def retrieve_windowed_diagram_refs(
+    nar_id: str,
+    release_number: str,
+    rtype: str,
+    doc_id: Optional[str],
+    evidence_hits: List[Dict[str, Any]],
+    top_n: int = 6,
+    page_padding: int = 1,
+) -> List[Dict[str, Any]]:
+    """Retrieve diagrams from the same document/page window as the topic evidence."""
+    anchor, anchor_pages = _build_evidence_page_window(
+        evidence_hits,
+        page_padding=page_padding,
+        max_pages=max(6, top_n * 2),
+    )
+    if not anchor_pages:
+        return []
+
+    where = ["nar_id=:nar", "release_number=:rel", "rtype=:rtype", "page_num IS NOT NULL", "page_num BETWEEN :page_min AND :page_max"]
+    params: Dict[str, Any] = {
+        "nar": nar_id,
+        "rel": release_number,
+        "rtype": rtype,
+        "page_min": min(anchor_pages),
+        "page_max": max(anchor_pages),
+        "row_limit": max(12, top_n * 6),
+    }
+    if doc_id:
+        where.append("doc_id=:doc_id")
+        params["doc_id"] = doc_id
+    elif anchor is not None:
+        anchor_kind, anchor_value = anchor
+        where.append(f"{anchor_kind}=:anchor_value")
+        params["anchor_value"] = anchor_value
+
+    sql = text(f"""
+        SELECT caption, doc_id, doc_uri, page_num, chunk_index, metadata
+        FROM {TABLE_MM_EVID}
+        WHERE {" AND ".join(where)}
+        ORDER BY page_num, chunk_index
+        LIMIT :row_limit
+    """)
+    engine = get_engine()
+    with engine.connect() as conn:
+        rows = conn.execute(sql, params).fetchall()
+
+    refs = [_build_diagram_ref(row) for row in rows]
+    if not refs:
+        return []
+
+    anchor_page_set = set(anchor_pages)
+    refs.sort(
+        key=lambda ref: (
+            min(abs((_coerce_int(ref.get("page_num")) or 0) - page) for page in anchor_page_set),
+            0 if (_coerce_int(ref.get("page_num")) or 0) in anchor_page_set else 1,
+            _coerce_int(ref.get("page_num")) or 0,
+            _coerce_int(ref.get("chunk_index")) or 0,
+        )
+    )
+    return _dedupe_diagram_refs(refs, limit=top_n)
 
 
 def retrieve_keyword_diagram_refs(
@@ -2510,7 +2644,7 @@ def retrieve_keyword_diagram_refs(
 
     lexical_score_sql = " + ".join(score_terms) if score_terms else "0"
     sql = text(f"""
-        SELECT caption, doc_uri, page_num, metadata,
+                SELECT caption, doc_id, doc_uri, page_num, chunk_index, metadata,
                ({lexical_score_sql}) AS score
         FROM {TABLE_MM_EVID}
         WHERE {" AND ".join(where)}
@@ -2566,7 +2700,7 @@ def retrieve_mm_diagrams(
         where.append("doc_id=:doc_id")
         params["doc_id"] = doc_id
     sql = text(f"""
-        SELECT caption, doc_uri, page_num, metadata,
+        SELECT caption, doc_id, doc_uri, page_num, chunk_index, metadata,
                embedding <-> CAST(:vec AS vector) AS distance
         FROM {TABLE_MM_EVID}
         WHERE {" AND ".join(where)}
@@ -2877,24 +3011,39 @@ def run_validation(
             max_total_chars=1000,
         )
 
-        is_diagram = (
-            ("diagram" in tag.lower())
-            or ("diagram" in notes.lower())
-            or ("diagram" in conds.lower())
-            or any(isinstance(k, str) and "diagram" in k.lower() for k in kws)
+        is_diagram = _is_diagram_like_topic(
+            tag=tag,
+            semantic_tag=semantic_tag,
+            notes=notes,
+            conds=conds,
+            keywords=kws,
         )
 
         mm_hits: List[Dict[str, str]] = []
         if enable_mm and is_diagram:
-            mm_candidate_hits = retrieve_mm_diagrams_safe(
+            diagram_candidate_limit = max(6, min(12, top_k * 2))
+            mm_candidate_hits = retrieve_windowed_diagram_refs(
+                nar_id,
+                release_number,
+                rtype,
+                effective_doc_id,
+                ev_hits,
+                top_n=diagram_candidate_limit,
+                page_padding=1,
+            )
+            mm_candidate_hits.extend(retrieve_mm_diagrams_safe(
                 query_full,
                 nar_id,
                 release_number,
                 rtype,
                 effective_doc_id,
-                top_n=3,
+                top_n=diagram_candidate_limit,
                 dim=MM_DIM,
                 search_phrases=topic_search_phrases,
+            ))
+            mm_candidate_hits = _dedupe_diagram_refs(
+                mm_candidate_hits,
+                limit=diagram_candidate_limit,
             )
             mm_hits = _filter_diagram_refs_for_topic(
                 mm_candidate_hits,
