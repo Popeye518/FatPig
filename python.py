@@ -3,12 +3,7 @@ import argparse
 import json
 import os
 import re
-import sys
-import urllib3
-from datetime import datetime
-from io import BytesIO
-from pathlib import Path
-from urllib.parse import parse_qs, unquote, urlparse
+import.parse import parse_qs, unquote, urlparseimport sys
 
 import requests
 from bs4 import BeautifulSoup
@@ -127,12 +122,14 @@ class ConfluenceClient:
         origin = self.get_origin(page_url)
 
         bases = []
+
         if "/wiki/" in parsed.path:
             bases.append(f"{origin}/wiki/rest/api")
 
         bases.append(f"{origin}/rest/api")
 
         unique = []
+
         for base in bases:
             if base not in unique:
                 unique.append(base)
@@ -170,6 +167,7 @@ class ConfluenceClient:
 
         for pattern in patterns:
             match = re.search(pattern, page_url)
+
             if match:
                 return match.group(1)
 
@@ -210,6 +208,7 @@ class ConfluenceClient:
             try:
                 safe_space = requests.utils.quote(space_key)
                 safe_title = requests.utils.quote(title)
+
                 url = (
                     f"{api_base}/content"
                     f"?spaceKey={safe_space}"
@@ -227,7 +226,9 @@ class ConfluenceClient:
                 page["_api_base"] = api_base
                 page["_page_id"] = str(page.get("id"))
                 page["_source_url"] = page_url
+
                 return page
+
             except Exception as ex:
                 last_error = ex
 
@@ -357,6 +358,7 @@ class ConfluenceParser:
 
         if not sections:
             page_text = self.clean_text(soup.get_text(" ", strip=True))
+
             return [
                 {
                     "heading": "Page Content",
@@ -1046,36 +1048,33 @@ class ReportBuilder:
 
         return report, output_path
 
-    
     def pdf_image(self, image_path):
-    img = Image.open(image_path)
-    width, height = img.size
+        img = Image.open(image_path)
+        width, height = img.size
 
-    page_width, page_height = landscape(A4)
+        page_width, page_height = landscape(A4)
 
-    max_width = page_width - 80
-    max_height = page_height - 120
+        max_width = page_width - 80
+        max_height = page_height - 120
 
-    ratio = min(max_width / width, max_height / height)
+        ratio = min(max_width / width, max_height / height)
 
-    display_width = width * ratio
-    display_height = height * ratio
+        display_width = width * ratio
+        display_height = height * ratio
 
-    return PdfImage(image_path, width=display_width, height=display_height)
-
+        return PdfImage(image_path, width=display_width, height=display_height)
 
     def build_pdf(self, report, output_dir):
         output_path = Path(output_dir) / self.output_pdf
 
-        
         doc = SimpleDocTemplate(
-        str(output_path),
-        pagesize=landscape    leftMargin=30,    pagesize=landscape(A4),
-        topMargin=30,
-        bottomMargin=30,
-    )
-        rightMargin=30,
-
+            str(output_path),
+            pagesize=landscape(A4),
+            rightMargin=30,
+            leftMargin=30,
+            topMargin=30,
+            bottomMargin=30,
+        )
 
         styles = getSampleStyleSheet()
 
@@ -1113,7 +1112,7 @@ class ReportBuilder:
             ["Quality Score", str(metadata.get("overall_quality_score", ""))],
         ]
 
-        summary_table = Table(summary_rows, colWidths=[1.8 * inch, 4.8 * inch])
+        summary_table = Table(summary_rows, colWidths=[2.0 * inch, 7.0 * inch])
         summary_table.setStyle(
             TableStyle(
                 [
@@ -1150,7 +1149,7 @@ class ReportBuilder:
                     ]
                 )
 
-            table = Table(rows, colWidths=[1.2 * inch, 2.2 * inch, 1.0 * inch, 2.2 * inch])
+            table = Table(rows, colWidths=[1.7 * inch, 3.0 * inch, 1.2 * inch, 3.6 * inch])
             table.setStyle(
                 TableStyle(
                     [
@@ -1176,17 +1175,21 @@ class ReportBuilder:
             story.append(Paragraph(f"Diagram Available: {self.escape(topic.get('diagram_available', ''))}", styles["SmallText"]))
             story.append(Spacer(1, 8))
 
-            
             image_path = topic.get("local_image_path")
 
             if image_path and os.path.exists(image_path):
-            try:
-                story.append(PageBreak())
-                story.append(Paragraph("Diagram", styles["SectionTitle"]))
-                story.append(self.pdf_image(image_path))
-                story.append(PageBreak())
-            except Exception:
-                story.append(Paragraph("Diagram image could not be rendered in PDF.", styles["SmallText"]))
+                try:
+                    story.append(PageBreak())
+                    story.append(Paragraph("Diagram", styles["SectionTitle"]))
+                    story.append(self.pdf_image(image_path))
+                    story.append(PageBreak())
+                except Exception:
+                    story.append(
+                        Paragraph(
+                            "Diagram image could not be rendered in PDF.",
+                            styles["SmallText"],
+                        )
+                    )
 
             story.append(Paragraph("Diagram Explanation", styles["SectionTitle"]))
             story.append(Paragraph(self.escape(topic.get("diagram_explanation", "")), styles["BodyText"]))
@@ -1211,7 +1214,7 @@ class ReportBuilder:
                         ]
                     )
 
-                check_table = Table(rows, colWidths=[1.8 * inch, 0.9 * inch, 2.0 * inch, 1.9 * inch])
+                check_table = Table(rows, colWidths=[2.4 * inch, 1.2 * inch, 3.0 * inch, 2.9 * inch])
                 check_table.setStyle(
                     TableStyle(
                         [
@@ -1241,7 +1244,7 @@ class ReportBuilder:
                 ["Recommendations", self.escape("; ".join(quality.get("recommendations", [])))],
             ]
 
-            quality_table = Table(quality_rows, colWidths=[1.8 * inch, 4.8 * inch])
+            quality_table = Table(quality_rows, colWidths=[2.0 * inch, 7.0 * inch])
             quality_table.setStyle(
                 TableStyle(
                     [
@@ -1529,3 +1532,7 @@ def main():
 
 if __name__ == "__main__":
     main()
+import urllib3
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
