@@ -15,7 +15,7 @@ from bs4 import BeautifulSoup
 from PIL import Image
 
 from reportlab.lib import colors
-from reportlab.lib.pagesizes import A4
+from reportlab.lib.pagesizes import A4, landscape
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import (
@@ -1046,27 +1046,36 @@ class ReportBuilder:
 
         return report, output_path
 
+    
     def pdf_image(self, image_path):
-        img = Image.open(image_path)
-        width, height = img.size
+    img = Image.open(image_path)
+    width, height = img.size
 
-        max_width = 6.5 * inch
-        max_height = 4.4 * inch
-        ratio = min(max_width / width, max_height / height)
+    page_width, page_height = landscape(A4)
 
-        return PdfImage(image_path, width=width * ratio, height=height * ratio)
+    max_width = page_width - 80
+    max_height = page_height - 120
+
+    ratio = min(max_width / width, max_height / height)
+
+    display_width = width * ratio
+    display_height = height * ratio
+
+    return PdfImage(image_path, width=display_width, height=display_height)
+
 
     def build_pdf(self, report, output_dir):
         output_path = Path(output_dir) / self.output_pdf
 
+        
         doc = SimpleDocTemplate(
-            str(output_path),
-            pagesize=A4,
-            rightMargin=36,
-            leftMargin=36,
-            topMargin=36,
-            bottomMargin=36,
-        )
+        str(output_path),
+        pagesize=landscape    leftMargin=30,    pagesize=landscape(A4),
+        topMargin=30,
+        bottomMargin=30,
+    )
+        rightMargin=30,
+
 
         styles = getSampleStyleSheet()
 
@@ -1167,14 +1176,17 @@ class ReportBuilder:
             story.append(Paragraph(f"Diagram Available: {self.escape(topic.get('diagram_available', ''))}", styles["SmallText"]))
             story.append(Spacer(1, 8))
 
+            
             image_path = topic.get("local_image_path")
 
             if image_path and os.path.exists(image_path):
-                try:
-                    story.append(self.pdf_image(image_path))
-                    story.append(Spacer(1, 10))
-                except Exception:
-                    story.append(Paragraph("Diagram image could not be rendered in PDF.", styles["SmallText"]))
+            try:
+                story.append(PageBreak())
+                story.append(Paragraph("Diagram", styles["SectionTitle"]))
+                story.append(self.pdf_image(image_path))
+                story.append(PageBreak())
+            except Exception:
+                story.append(Paragraph("Diagram image could not be rendered in PDF.", styles["SmallText"]))
 
             story.append(Paragraph("Diagram Explanation", styles["SectionTitle"]))
             story.append(Paragraph(self.escape(topic.get("diagram_explanation", "")), styles["BodyText"]))
