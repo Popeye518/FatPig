@@ -3,7 +3,12 @@ import argparse
 import json
 import os
 import re
-import.parse import parse_qs, unquote, urlparseimport sys
+import sys
+import urllib3
+from datetime import datetime
+from io import BytesIO
+from pathlib import Path
+from urllib.parse import parse_qs, unquote, urlparse
 
 import requests
 from bs4 import BeautifulSoup
@@ -258,7 +263,7 @@ class ConfluenceClient:
         while True:
             url = (
                 f"{api_base}/content/{page_id}/child/attachment"
-                f"?limit={limit}&start={start}&expand=version"
+                f"?limit={limit}&start={start}&expand=version,metadata"
             )
 
             data = self.request_json(url)
@@ -321,13 +326,20 @@ class ConfluenceParser:
         value = re.sub(r"\s+", " ", str(value))
         return value.strip()
 
+    def get_storage_html(self, page):
+        return page.get("body", {}).get("storage", {}).get("value", "") or ""
+
+    def get_view_html(self, page):
+        return page.get("body", {}).get("view", {}).get("value", "") or ""
+
     def get_html(self, page):
-        storage = page.get("body", {}).get("storage", {}).get("value", "")
+        storage_html = self.get_storage_html(page)
+        view_html = self.get_view_html(page)
 
-        if storage:
-            return storage
+        if storage_html and view_html:
+            return storage_html + "\n" + view_html
 
-        return page.get("body", {}).get("view", {}).get("value", "")
+        return storage_html or view_html
 
     def parse_sections(self, html):
         soup = BeautifulSoup(html or "", "html.parser")
@@ -358,14 +370,7 @@ class ConfluenceParser:
 
         if not sections:
             page_text = self.clean_text(soup.get_text(" ", strip=True))
-
-            return [
-                {
-                    "heading": "Page Content",
-                    "level": "h1",
-                    "text": page_text,
-                }
-            ]
+            return [{"heading": "Page Content", "level": "h1", "text": page_text}]
 
         for section in sections:
             section["text"] = self.clean_text(" ".join(section["text_parts"]))
@@ -535,8 +540,10 @@ class ConfluenceParser:
         return self.clean_text(" ".join(reversed(parts[-12:])))
 
     def find_attachment_filename_in_node(self, node):
-        for child in node.find_all(True):
-            attrs = child.attrs or {}
+        nodes_to_check = [node] + list(node.find_all(True))
+
+        for current in nodes_to_check:
+            attrs = current.attrs or {}
 
             for key, value in attrs.items():
                 key_lower = str(key).lower()
@@ -545,9 +552,9 @@ class ConfluenceParser:
                     if value:
                         return str(value)
 
-            child_name = child.name or ""
+            current_name = current.name or ""
 
-            if child_name.lower().endswith("attachment"):
+            if current_name.lower().endswith("attachment"):
                 for value in attrs.values():
                     if value:
                         return str(value)
@@ -558,7 +565,9 @@ class ConfluenceParser:
         attrs = node.attrs or {}
 
         for key, value in attrs.items():
-            if str(key).lower().endswith("name"):
+            key_lower = str(key).lower()
+
+            if key_lower.endswith("name") or key_lower == "name":
                 return str(value)
 
         return ""
@@ -584,11 +593,19 @@ class ConfluenceParser:
 
         return params
 
-    def extract_diagrams(self, html):
+    def normalize_diagram_key(self, diagram):
+        filename = diagram.get("attachment_filename") or ""
+        src = diagram.get("image_src") or ""
+        diagram_type = diagram.get("diagram_type") or ""
+        macro_name = diagram.get("macro_name") or ""
+        heading = diagram.get("heading") or ""
+
+        key = f"{diagram_type}|{macro_name}|{filename}|{src}|{heading}"
+        return key.strip().lower()
+
+    def extract_diagrams_from_html(self, html, source_name):
         soup = BeautifulSoup(html or "", "html.parser")
         diagrams = []
-        seen = set()
-        counter = 1
 
         for node in soup.find_all(True):
             tag = (node.name or "").lower()
@@ -607,10 +624,17 @@ class ConfluenceParser:
 
             if is_html_img:
                 diagram_type = "html_image"
-                src = node.get("src")
+                src = (
+                    node.get("src")
+                    or node.get("data-src")
+                    or node.get("data-image-src")
+                    or node.get("data-original-src")
+                )
+
                 filename = (
                     node.get("data-linked-resource-default-alias")
                     or node.get("data-linked-resource-id")
+                    or node.get("data-attachment-name")
                     or node.get("alt")
                     or node.get("title")
                 )
@@ -631,36 +655,57 @@ class ConfluenceParser:
 
                 params = self.find_macro_parameters(node)
                 diagram_type = f"macro_{macro_name_lower or 'unknown'}"
+
                 filename = (
                     self.find_attachment_filename_in_node(node)
                     or params.get("diagramName")
                     or params.get("name")
                     or params.get("filename")
                     or params.get("attachment")
+                    or params.get("page")
                 )
 
-            unique_key = f"{diagram_type}|{src}|{filename}|{self.clean_text(node.get_text(' ', strip=True))[:100]}"
-
-            if unique_key in seen:
+            if not src and not filename and not macro_name:
                 continue
-
-            seen.add(unique_key)
 
             diagrams.append(
                 {
-                    "diagram_id": f"diagram_{counter:03d}",
                     "diagram_type": diagram_type,
                     "macro_name": macro_name,
                     "heading": self.nearest_heading_for_node(node),
                     "context_text": self.surrounding_text_for_node(node),
                     "image_src": src,
                     "attachment_filename": filename,
+                    "html_source": source_name,
                 }
             )
 
+        return diagrams
+
+    def extract_diagrams(self, storage_html, view_html=None):
+        all_diagrams = []
+
+        all_diagrams.extend(self.extract_diagrams_from_html(storage_html, "storage"))
+
+        if view_html:
+            all_diagrams.extend(self.extract_diagrams_from_html(view_html, "view"))
+
+        final_diagrams = []
+        seen = set()
+        counter = 1
+
+        for diagram in all_diagrams:
+            key = self.normalize_diagram_key(diagram)
+
+            if key in seen:
+                continue
+
+            seen.add(key)
+            diagram["diagram_id"] = f"diagram_{counter:03d}"
+            final_diagrams.append(diagram)
             counter += 1
 
-        return diagrams
+        return final_diagrams
 
 
 class GeminiAnalyzer:
@@ -1172,6 +1217,7 @@ class ReportBuilder:
             story.append(Paragraph(self.escape(topic.get("topic_name", "")), styles["Heading1"]))
             story.append(Paragraph(f"Diagram ID: {self.escape(topic.get('diagram_id', ''))}", styles["SmallText"]))
             story.append(Paragraph(f"Diagram Type: {self.escape(topic.get('diagram_type', ''))}", styles["SmallText"]))
+            story.append(Paragraph(f"HTML Source: {self.escape(topic.get('html_source', ''))}", styles["SmallText"]))
             story.append(Paragraph(f"Diagram Available: {self.escape(topic.get('diagram_available', ''))}", styles["SmallText"]))
             story.append(Spacer(1, 8))
 
@@ -1312,6 +1358,66 @@ def resolve_diagram_image(client, page, attachments, diagram):
     return image_bytes, image_source
 
 
+def add_missing_image_attachments_as_diagrams(diagrams, attachments):
+    existing_files = set()
+
+    for diagram in diagrams:
+        filename = diagram.get("attachment_filename")
+
+        if filename:
+            existing_files.add(str(filename).strip().lower())
+
+    image_extensions = {
+        ".png",
+        ".jpg",
+        ".jpeg",
+        ".gif",
+        ".webp",
+        ".bmp",
+        ".tif",
+        ".tiff",
+        ".svg",
+    }
+
+    next_number = len(diagrams) + 1
+
+    for attachment in attachments:
+        title = str(attachment.get("title", "")).strip()
+
+        if not title:
+            continue
+
+        title_lower = title.lower()
+
+        if title_lower in existing_files:
+            continue
+
+        media_type = str(attachment.get("metadata", {}).get("mediaType", "")).lower()
+        is_image_by_extension = any(title_lower.endswith(ext) for ext in image_extensions)
+        is_image_by_media_type = media_type.startswith("image/")
+
+        if not is_image_by_extension and not is_image_by_media_type:
+            continue
+
+        diagrams.append(
+            {
+                "diagram_id": f"diagram_{next_number:03d}",
+                "diagram_type": "image_attachment_fallback",
+                "macro_name": "",
+                "heading": "Image Attachment",
+                "context_text": "",
+                "image_src": None,
+                "attachment_filename": title,
+                "html_source": "attachment_fallback",
+            }
+        )
+
+        existing_files.add(title_lower)
+        next_number += 1
+
+    return diagrams
+
+
 def build_topics(evidence_page, expectations, diagrams, analyzer, client, attachments, output_dir):
     topics = []
 
@@ -1333,6 +1439,7 @@ def build_topics(evidence_page, expectations, diagrams, analyzer, client, attach
             "diagram_id": diagram.get("diagram_id"),
             "diagram_type": diagram.get("diagram_type"),
             "macro_name": diagram.get("macro_name"),
+            "html_source": diagram.get("html_source"),
             "diagram_heading": diagram.get("heading"),
             "diagram_available": bool(image_bytes),
             "diagram_image_source": image_source,
@@ -1368,6 +1475,7 @@ def build_topics(evidence_page, expectations, diagrams, analyzer, client, attach
                 "diagram_id": "diagram_000",
                 "diagram_type": "none",
                 "macro_name": "",
+                "html_source": "",
                 "diagram_heading": "",
                 "diagram_available": False,
                 "diagram_image_source": None,
@@ -1390,7 +1498,7 @@ def build_topics(evidence_page, expectations, diagrams, analyzer, client, attach
                         "missing_details": [
                             "No supported diagram was extracted from the evidence page."
                         ],
-                        "remarks": "Check evidence_storage.html and evidence_attachments.json to confirm diagram storage format.",
+                        "remarks": "Check evidence_storage.html, evidence_view.html and evidence_attachments.json to confirm diagram storage format.",
                     }
                 ],
                 "missing_expected_details": [
@@ -1470,20 +1578,31 @@ def main():
     print("Fetching template page...")
     template_page = client.fetch_page(args.template_url)
 
-    evidence_html = parser.get_html(evidence_page)
-    template_html = parser.get_html(template_page)
+    evidence_storage_html = parser.get_storage_html(evidence_page)
+    evidence_view_html = parser.get_view_html(evidence_page)
+    template_storage_html = parser.get_storage_html(template_page)
+    template_view_html = parser.get_view_html(template_page)
+
+    evidence_html = evidence_storage_html + "\n" + evidence_view_html
+    template_html = template_storage_html + "\n" + template_view_html
 
     save_debug_file(output_dir / "evidence_page_raw.json", evidence_page)
     save_debug_file(output_dir / "template_page_raw.json", template_page)
-    save_debug_file(output_dir / "evidence_storage.html", evidence_html)
-    save_debug_file(output_dir / "template_storage.html", template_html)
+    save_debug_file(output_dir / "evidence_storage.html", evidence_storage_html)
+    save_debug_file(output_dir / "evidence_view.html", evidence_view_html)
+    save_debug_file(output_dir / "template_storage.html", template_storage_html)
+    save_debug_file(output_dir / "template_view.html", template_view_html)
 
     print("Fetching evidence attachments...")
     evidence_attachments = client.fetch_attachments(evidence_page)
     save_debug_file(output_dir / "evidence_attachments.json", evidence_attachments)
 
-    print("Extracting diagrams...")
-    diagrams = parser.extract_diagrams(evidence_html)
+    print("Extracting diagrams from storage and view HTML...")
+    diagrams = parser.extract_diagrams(evidence_storage_html, evidence_view_html)
+
+    print("Adding missing image attachments as fallback diagrams...")
+    diagrams = add_missing_image_attachments_as_diagrams(diagrams, evidence_attachments)
+
     save_debug_file(output_dir / "extracted_diagrams.json", diagrams)
 
     print("Extracting template expectations...")
@@ -1519,7 +1638,9 @@ def main():
     print(f"Evidence raw page: {output_dir / 'evidence_page_raw.json'}")
     print(f"Template raw page: {output_dir / 'template_page_raw.json'}")
     print(f"Evidence storage HTML: {output_dir / 'evidence_storage.html'}")
+    print(f"Evidence view HTML: {output_dir / 'evidence_view.html'}")
     print(f"Template storage HTML: {output_dir / 'template_storage.html'}")
+    print(f"Template view HTML: {output_dir / 'template_view.html'}")
     print(f"Evidence attachments: {output_dir / 'evidence_attachments.json'}")
     print(f"Extracted diagrams: {output_dir / 'extracted_diagrams.json'}")
     print(f"Template expectations: {output_dir / 'template_expectations.json'}")
@@ -1532,7 +1653,3 @@ def main():
 
 if __name__ == "__main__":
     main()
-import urllib3
-from datetime import datetime
-from io import BytesIO
-from pathlib import Path
