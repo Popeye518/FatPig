@@ -1,14 +1,11 @@
+
 import argparse
-import base64
 import json
 import os
 import re
 import sys
-import tempfile
-from datetime import datetime
-from io import BytesIO
-from pathlib import Path
-from urllib.parse import parse_qs, quote, urljoin, urlparse
+import urllib3
+from_qs, unquote, urlparsefrom datetime import datetime
 
 import requests
 from bs4 import BeautifulSoup
@@ -20,7 +17,7 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import (
-    Image as ReportImage,
+    Image as PdfImage,
     PageBreak,
     Paragraph,
     SimpleDocTemplate,
@@ -28,7 +25,6 @@ from reportlab.platypus import (
     Table,
     TableStyle,
 )
-
 
 try:
     from google import genai
@@ -38,73 +34,202 @@ except Exception:
     types = None
 
 
+urllib3.disable_warnings(urllib3.exceptions.InsecureRequestWarning)
+
+
+CONFLUENCE_PAT = "PASTE_YOUR_CONFLUENCE_PAT_HERE"
+GEMINI_API_KEY = "PASTE_YOUR_GEMINI_API_KEY_HERE"
+GEMINI_MODEL = "gemini-2.5-flash"
+
+SSL_VERIFY = False
+
+
+DEFAULT_EXPECTATIONS_BY_TOPIC = {
+    "logical": [
+        "Application components are shown",
+        "Component relationships are shown",
+        "Logical flow between components is clear",
+        "Internal and external boundaries are clear",
+    ],
+    "functional": [
+        "Major functional modules are shown",
+        "Functional flow is clear",
+        "User or system interactions are shown",
+        "Responsibilities of each module are understandable",
+    ],
+    "integration": [
+        "Upstream systems are shown",
+        "Downstream systems are shown",
+        "Integration protocols or channels are mentioned",
+        "Data exchange direction is clear",
+        "External dependencies are identified",
+    ],
+    "deployment": [
+        "Hosting environment is shown",
+        "Application runtime or server layer is shown",
+        "Database or storage layer is shown",
+        "Environment details such as dev, test, prod, cloud, on-prem are mentioned",
+        "Deployment topology is understandable",
+    ],
+    "security": [
+        "Authentication mechanism is mentioned",
+        "Authorization or access control is mentioned",
+        "Security boundary is shown",
+        "Sensitive data protection or encryption is mentioned",
+        "Network security controls are shown if applicable",
+    ],
+    "database": [
+        "Database entities or data stores are shown",
+        "ER or data relationship is shown if expected",
+        "Tables or major data objects are identified",
+        "Data flow to and from database is clear",
+    ],
+    "network": [
+        "Network zones or boundaries are shown",
+        "Inbound and outbound communication paths are clear",
+        "Ports, protocols, gateway, firewall, or load balancer are mentioned if applicable",
+    ],
+    "disaster": [
+        "Backup or recovery strategy is mentioned",
+        "DR environment or failover approach is shown",
+        "Availability or resiliency design is explained",
+    ],
+    "architecture": [
+        "Main application components are shown",
+        "Data or request flow is clear",
+        "Integration points are shown",
+        "Database or storage layer is shown",
+        "Security and deployment considerations are visible or explained",
+    ],
+}
+
+
 class ConfluenceClient:
     def __init__(self, pat):
-        self.pat = pat
         self.session = requests.Session()
         self.session.headers.update({
             "Authorization": f"Bearer {pat}",
-            "Accept": "application/json"
+            "Accept": "application/json",
         })
 
-    def extract_page_id(self, page_url):
+    def get_origin(self, page_url):
+        parsed = urlparse(page_url)
+        return f"{parsed.scheme}://{parsed.netloc}"
+
+    def get_api_bases(self, page_url):
+        origin = self.get_origin(page_url)
+        parsed = urlparse(page_url)
+        bases = []
+
+        if "/wiki/" in parsed.path:
+            bases.append(f"{origin}/wiki/rest/api")
+
+        bases.append(f"{origin}/rest/api")
+
+        unique = []
+        for base in bases:
+            if base not in unique:
+                unique.append(base)
+
+        return unique
+
+    def request_json(self, url):
+        response = self.session.get(url, timeout=120, verify=SSL_VERIFY)
+        if response.status_code >= 400:
+            raise RuntimeError(f"{response.status_code}: {response.text[:1000]}")
+        return response.json()
+
+    def request_bytes(self, url):
+        response = self.session.get(url, timeout=180, verify=SSL_VERIFY)
+        if response.status_code >= 400:
+            return None
+        return response.content
+
+    def extract_page_id_from_url(self, page_url):
         parsed = urlparse(page_url)
         query = parse_qs(parsed.query)
 
         if "pageId" in query:
             return query["pageId"][0]
 
-        match = re.search(r"/pages/(\d+)", parsed.path)
-        if match:
-            return match.group(1)
+        patterns = [
+            r"/pages/(\d+)",
+            r"[?&]pageId=(\d+)",
+            r"/(\d+)(?:/|$)",
+        ]
 
-        match = re.search(r"/pageId=(\d+)", page_url)
-        if match:
-            return match.group(1)
+        for pattern in patterns:
+            match = re.search(pattern, page_url)
+            if match:
+                return match.group(1)
 
-        numbers = re.findall(r"/(\d+)(?:/|$)", parsed.path)
-        if numbers:
-            return numbers[-1]
+        return None
 
-        raise ValueError(f"Could not extract pageId from URL: {page_url}")
-
-    def get_base_candidates(self, page_url):
+    def extract_space_and_title_from_display_url(self, page_url):
         parsed = urlparse(page_url)
-        origin = f"{parsed.scheme}://{parsed.netloc}"
+        path = parsed.path
 
-        candidates = []
-        if "/wiki/" in parsed.path:
-            candidates.append(f"{origin}/wiki/rest/api")
-        candidates.append(f"{origin}/rest/api")
+        match = re.search(r"/display/([^/]+)/(.+)$", path)
+        if not match:
+            return None, None
 
-        unique = []
-        for item in candidates:
-            if item not in unique:
-                unique.append(item)
-        return unique
+        space_key = unquote(match.group(1))
+        title = unquote(match.group(2)).replace("+", " ")
 
-    def request_json(self, url):
-        response = self.session.get(url, timeout=60)
-        if response.status_code >= 400:
-            raise RuntimeError(f"Request failed: {response.status_code} {response.text[:500]}")
-        return response.json()
+        return space_key, title
 
-    def fetch_page(self, page_url):
-        page_id = self.extract_page_id(page_url)
+    def fetch_page_by_id(self, page_url, page_id):
         last_error = None
 
-        for api_base in self.get_base_candidates(page_url):
+        for api_base in self.get_api_bases(page_url):
             try:
-                url = f"{api_base}/content/{page_id}?expand=body.storage,version,space,ancestors"
+                url = f"{api_base}/content/{page_id}?expand=body.storage,body.view,version,space,ancestors"
                 data = self.request_json(url)
                 data["_api_base"] = api_base
-                data["_page_id"] = page_id
                 data["_source_url"] = page_url
+                data["_page_id"] = str(data.get("id", page_id))
                 return data
             except Exception as ex:
                 last_error = ex
 
-        raise RuntimeError(f"Could not fetch Confluence page. Last error: {last_error}")
+        raise RuntimeError(f"Could not fetch page by id. Last error: {last_error}")
+
+    def fetch_page_by_space_and_title(self, page_url, space_key, title):
+        last_error = None
+
+        for api_base in self.get_api_bases(page_url):
+            try:
+                safe_title = requests.utils.quote(title)
+                safe_space = requests.utils.quote(space_key)
+                url = f"{api_base}/content?spaceKey={safe_space}&title={safe_title}&expand=body.storage,body.view,version,space,ancestors"
+                data = self.request_json(url)
+                results = data.get("results", [])
+
+                if not results:
+                    raise RuntimeError("No page found for space/title")
+
+                page = results[0]
+                page["_api_base"] = api_base
+                page["_source_url"] = page_url
+                page["_page_id"] = str(page.get("id"))
+                return page
+            except Exception as ex:
+                last_error = ex
+
+        raise RuntimeError(f"Could not fetch page by space/title. Last error: {last_error}")
+
+    def fetch_page(self, page_url):
+        page_id = self.extract_page_id_from_url(page_url)
+
+        if page_id:
+            return self.fetch_page_by_id(page_url, page_id)
+
+        space_key, title = self.extract_space_and_title_from_display_url(page_url)
+
+        if space_key and title:
+            return self.fetch_page_by_space_and_title(page_url, space_key, title)
+
+        raise ValueError("Could not extract pageId or space/title from Confluence URL.")
 
     def fetch_attachments(self, page):
         api_base = page["_api_base"]
@@ -119,49 +244,59 @@ class ConfluenceClient:
             results = data.get("results", [])
             attachments.extend(results)
 
-            size = data.get("size", len(results))
-            if size < limit:
+            if len(results) < limit:
                 break
 
             start += limit
 
         return attachments
 
-    def download_url(self, page, url):
+    def absolute_url(self, page, url):
         if not url:
             return None
 
-        parsed_page = urlparse(page["_source_url"])
-        origin = f"{parsed_page.scheme}://{parsed_page.netloc}"
+        if url.startswith("http://") or url.startswith("https://"):
+            return url
+
+        origin = self.get_origin(page["_source_url"])
 
         if url.startswith("/"):
-            download_url = origin + url
-        else:
-            download_url = url
+            return origin + url
 
-        response = self.session.get(download_url, timeout=90)
-        if response.status_code >= 400:
+        return origin + "/" + url
+
+    def download_url(self, page, url):
+        final_url = self.absolute_url(page, url)
+        if not final_url:
             return None
-        return response.content
+        return self.request_bytes(final_url)
 
     def download_attachment_by_name(self, page, attachments, filename):
         if not filename:
             return None
 
+        filename = filename.strip()
+        filename_lower = filename.lower()
+
         for attachment in attachments:
             title = attachment.get("title", "")
-            if title == filename:
-                links = attachment.get("_links", {})
-                download_link = links.get("download")
+            if title == filename or title.lower() == filename_lower:
+                download_link = attachment.get("_links", {}).get("download")
                 return self.download_url(page, download_link)
 
-        normalized = filename.strip().lower()
+        return None
+
+    def get_attachment_download_link(self, page, attachments, filename):
+        if not filename:
+            return None
+
+        filename = filename.strip()
+        filename_lower = filename.lower()
+
         for attachment in attachments:
-            title = attachment.get("title", "").strip().lower()
-            if title == normalized:
-                links = attachment.get("_links", {})
-                download_link = links.get("download")
-                return self.download_url(page, download_link)
+            title = attachment.get("title", "")
+            if title == filename or title.lower() == filename_lower:
+                return self.absolute_url(page, attachment.get("_links", {}).get("download"))
 
         return None
 
@@ -169,22 +304,25 @@ class ConfluenceClient:
 class ConfluenceParser:
     HEADING_TAGS = {"h1", "h2", "h3", "h4", "h5", "h6"}
 
-    def clean_text(self, text):
-        if not text:
+    def clean_text(self, value):
+        if not value:
             return ""
-        text = re.sub(r"\s+", " ", text)
-        return text.strip()
+        value = re.sub(r"\s+", " ", str(value))
+        return value.strip()
 
-    def page_html(self, page):
-        return page.get("body", {}).get("storage", {}).get("value", "") or ""
+    def get_html(self, page):
+        storage = page.get("body", {}).get("storage", {}).get("value", "")
+        if storage:
+            return storage
+        return page.get("body", {}).get("view", {}).get("value", "")
 
     def parse_sections(self, html):
-        soup = BeautifulSoup(html, "html.parser")
+        soup = BeautifulSoup(html or "", "html.parser")
         sections = []
         current = None
 
         for node in soup.find_all(True):
-            tag = node.name.lower() if node.name else ""
+            tag = (node.name or "").lower()
 
             if tag in self.HEADING_TAGS:
                 heading = self.clean_text(node.get_text(" ", strip=True))
@@ -197,68 +335,125 @@ class ConfluenceParser:
                     sections.append(current)
                 continue
 
-            if current and tag in {"p", "li", "td", "th"}:
+            if current and tag in {"p", "li", "td", "th", "div"}:
                 text = self.clean_text(node.get_text(" ", strip=True))
                 if text and text not in current["text_parts"]:
                     current["text_parts"].append(text)
+
+        if not sections:
+            page_text = self.clean_text(soup.get_text(" ", strip=True))
+            sections.append({
+                "heading": "Page Content",
+                "level": "h1",
+                "text": page_text,
+            })
+            return sections
 
         for section in sections:
             section["text"] = self.clean_text(" ".join(section["text_parts"]))
             section.pop("text_parts", None)
 
-        if not sections:
-            text = self.clean_text(soup.get_text(" ", strip=True))
-            sections.append({
-                "heading": "Page Content",
-                "level": "h1",
-                "text": text
-            })
-
         return sections
 
-    def extract_template_expectations(self, html):
-        sections = self.parse_sections(html)
-        expectations = []
+    def extract_tables_as_text(self, html):
+        soup = BeautifulSoup(html or "", "html.parser")
+        table_texts = []
 
-        for section in sections:
-            heading = section.get("heading", "")
-            text = section.get("text", "")
-            if not heading:
-                continue
+        for index, table in enumerate(soup.find_all("table"), start=1):
+            rows = []
+            for tr in table.find_all("tr"):
+                cells = []
+                for cell in tr.find_all(["th", "td"]):
+                    cell_text = self.clean_text(cell.get_text(" ", strip=True))
+                    if cell_text:
+                        cells.append(cell_text)
+                if cells:
+                    rows.append(" | ".join(cells))
 
-            items = self.extract_expected_items_from_text(text)
+            if rows:
+                table_texts.append({
+                    "table_id": f"table_{index:03d}",
+                    "text": "\n".join(rows),
+                })
 
-            expectations.append({
-                "topic": heading,
-                "expected_details": items,
-                "raw_text": text
-            })
-
-        return expectations
+        return table_texts
 
     def extract_expected_items_from_text(self, text):
+        text = self.clean_text(text)
         if not text:
             return []
 
-        candidates = []
+        parts = re.split(r"(?:\n|•|\u2022|;|\. )", text)
+        items = []
 
-        splitters = re.split(r"[.;]\s+|\n+|•|\u2022", text)
-        for item in splitters:
-            item = self.clean_text(item)
-            if len(item) >= 8:
-                candidates.append(item)
+        for part in parts:
+            part = self.clean_text(part)
+            if len(part) < 8:
+                continue
+
+            if part.lower() in {"yes", "no", "na", "n/a"}:
+                continue
+
+            items.append(part)
 
         deduped = []
         seen = set()
-        for item in candidates:
+
+        for item in items:
             key = item.lower()
             if key not in seen:
                 seen.add(key)
                 deduped.append(item)
 
-        return deduped[:20]
+        return deduped[:30]
 
-    def nearest_section_for_node(self, node):
+    def add_default_expectations_if_needed(self, topic, items):
+        topic_lower = topic.lower()
+        existing = list(items or [])
+
+        for key, defaults in DEFAULT_EXPECTATIONS_BY_TOPIC.items():
+            if key in topic_lower:
+                for item in defaults:
+                    if item not in existing:
+                        existing.append(item)
+
+        return existing[:40]
+
+    def extract_template_expectations(self, html):
+        sections = self.parse_sections(html)
+        tables = self.extract_tables_as_text(html)
+
+        expectations = []
+
+        for section in sections:
+            topic = section.get("heading", "")
+            raw_text = section.get("text", "")
+            items = self.extract_expected_items_from_text(raw_text)
+            items = self.add_default_expectations_if_needed(topic, items)
+
+            expectations.append({
+                "topic": topic,
+                "expected_details": items,
+                "raw_text": raw_text,
+                "source": "section",
+            })
+
+        for table in tables:
+            topic = f"Template Table {table['table_id']}"
+            raw_text = table["text"]
+            items = self.extract_expected_items_from_text(raw_text)
+
+            if items:
+                expectations.append({
+                    "topic": topic,
+                    "expected_details": items,
+                    "raw_text": raw_text,
+                    "source": "table",
+                })
+
+        return expectations
+
+    def nearest_heading_for_node(self, node):
         previous = node
         while previous:
             previous = previous.find_previous()
@@ -267,86 +462,155 @@ class ConfluenceParser:
         return "Unmapped Diagram"
 
     def surrounding_text_for_node(self, node):
-        heading = None
+        heading_node = None
         previous = node
 
         while previous:
             previous = previous.find_previous()
             if previous and previous.name and previous.name.lower() in self.HEADING_TAGS:
-                heading = previous
+                heading_node = previous
                 break
 
         parts = []
-        cursor = heading.find_next_sibling() if heading else node.find_previous()
-        while cursor and cursor != node:
-            if getattr(cursor, "name", None):
-                tag = cursor.name.lower()
-                if tag in self.HEADING_TAGS:
-                    break
-                if tag in {"p", "li", "td", "th", "div"}:
-                    text = self.clean_text(cursor.get_text(" ", strip=True))
-                    if text:
-                        parts.append(text)
-            cursor = cursor.find_next_sibling()
+
+        if heading_node:
+            cursor = heading_node.find_next_sibling()
+            while cursor and cursor != node:
+                if getattr(cursor, "name", None):
+                    tag = cursor.name.lower()
+                    if tag in self.HEADING_TAGS:
+                        break
+                    if tag in {"p", "li", "td", "th", "div"}:
+                        text = self.clean_text(cursor.get_text(" ", strip=True))
+                        if text:
+                            parts.append(text)
+                cursor = cursor.find_next_sibling()
 
         if not parts:
-            for prev in node.find_all_previous(["p", "li"], limit=5):
+            for prev in node.find_all_previous(["p", "li", "td", "th"], limit=10):
                 text = self.clean_text(prev.get_text(" ", strip=True))
                 if text:
                     parts.append(text)
 
-        return self.clean_text(" ".join(reversed(parts[-8:])))
+        return self.clean_text(" ".join(reversed(parts[-12:])))
 
-    def extract_filename_from_ac_image(self, image_node):
-        for child in image_node.find_all(True):
-            name = child.name or ""
+    def find_attachment_filename_in_node(self, node):
+        for child in node.find_all(True):
             attrs = child.attrs or {}
 
-            if name.endswith("attachment"):
-                for key, value in attrs.items():
-                    if key.endswith("filename"):
-                        return value
-
             for key, value in attrs.items():
-                if key.endswith("filename"):
-                    return value
+                key_lower = str(key).lower()
+                if key_lower.endswith("filename") or "filename" in key_lower:
+                    if value:
+                        return str(value)
+
+            child_name = child.name or ""
+            if child_name.lower().endswith("attachment"):
+                for value in attrs.values():
+                    if value:
+                        return str(value)
 
         return None
 
-    def extract_images_with_headings(self, html):
-        soup = BeautifulSoup(html, "html.parser")
+    def find_macro_name(self, node):
+        attrs = node.attrs or {}
+
+        for key, value in attrs.items():
+            if str(key).lower().endswith("name"):
+                return str(value)
+
+        return ""
+
+    def find_macro_parameters(self, node):
+        params = {}
+
+        for child in node.find_all(True):
+            name = child.name or ""
+            attrs = child.attrs or {}
+
+            if "parameter" not in name.lower():
+                continue
+
+            param_name = None
+
+            for key, value in attrs.items():
+                if str(key).lower().endswith("name"):
+                    param_name = str(value)
+                    break
+
+            if param_name:
+                params[param_name] = self.clean_text(child.get_text(" ", strip=True))
+
+        return params
+
+    def extract_diagrams(self, html):
+        soup = BeautifulSoup(html or "", "html.parser")
         diagrams = []
+        seen = set()
         counter = 1
 
         for node in soup.find_all(True):
-            tag = node.name or ""
-            tag_lower = tag.lower()
+            tag = (node.name or "").lower()
 
-            is_ac_image = tag_lower.endswith("image")
-            is_html_img = tag_lower == "img"
+            is_html_img = tag == "img"
+            is_ac_image = tag.endswith("image")
+            is_macro = tag.endswith("structured-macro") or "structured-macro" in tag
 
-            if not is_ac_image and not is_html_img:
+            if not is_html_img and not is_ac_image and not is_macro:
                 continue
 
-            heading = self.nearest_section_for_node(node)
-            context = self.surrounding_text_for_node(node)
-
+            diagram_type = None
             src = None
             filename = None
+            macro_name = ""
 
             if is_html_img:
+                diagram_type = "html_image"
                 src = node.get("src")
-                filename = node.get("data-linked-resource-default-alias") or node.get("alt")
+                filename = (
+                    node.get("data-linked-resource-default-alias")
+                    or node.get("data-linked-resource-id")
+                    or node.get("alt")
+                    or node.get("title")
+                )
 
             if is_ac_image:
-                filename = self.extract_filename_from_ac_image(node)
+                diagram_type = "confluence_image"
+                filename = self.find_attachment_filename_in_node(node)
+
+            if is_macro:
+                macro_name = self.find_macro_name(node)
+                macro_name_lower = macro_name.lower()
+
+                if not any(x in macro_name_lower for x in ["draw", "gliffy", "plantuml", "diagram", "mermaid"]):
+                    continue
+
+                diagram_type = f"macro_{macro_name_lower or 'unknown'}"
+                params = self.find_macro_parameters(node)
+                filename = (
+                    self.find_attachment_filename_in_node(node)
+                    or params.get("diagramName")
+                    or params.get("name")
+                    or params.get("filename")
+                    or params.get("attachment")
+                )
+
+            unique_key = f"{diagram_type}|{src}|{filename}|{self.clean_text(node.get_text(' ', strip=True))[:100]}"
+            if unique_key in seen:
+                continue
+            seen.add(unique_key)
+
+            heading = self.nearest_heading_for_node(node)
+            context = self.surrounding_text_for_node(node)
 
             diagrams.append({
                 "diagram_id": f"diagram_{counter:03d}",
+                "diagram_type": diagram_type,
+                "macro_name": macro_name,
                 "heading": heading,
                 "context_text": context,
                 "image_src": src,
-                "attachment_filename": filename
+                "attachment_filename": filename,
             })
             counter += 1
 
@@ -354,31 +618,51 @@ class ConfluenceParser:
 
 
 class GeminiAnalyzer:
-    def __init__(self, api_key=None, model="gemini-2.5-flash"):
+    def __init__(self, api_key, model):
         self.api_key = api_key
         self.model = model
-        self.enabled = bool(api_key and genai and types)
+        self.enabled = bool(
+            api_key
+            and api_key != "PASTE_YOUR_GEMINI_API_KEY_HERE"
+            and genai
+            and types
+        )
 
-        if self.enabled:
-            self.client = genai.Client(api_key=api_key)
-        else:
-            self.client = None
+        self.client = genai.Client(api_key=api_key) if self.enabled else None
 
-    def safe_json_from_text(self, text):
+    def detect_mime_type(self, image_bytes):
+        if not image_bytes:
+            return None
+
+        if image_bytes.startswith(b"\x89PNG"):
+            return "image/png"
+
+        if image_bytes.startswith(b"\xff\xd8"):
+            return "image/jpeg"
+
+        if image_bytes.startswith(b"GIF"):
+            return "image/gif"
+
+        if image_bytes[:4] == b"RIFF" and b"WEBP" in image_bytes[:20]:
+            return "image/webp"
+
+        return "image/png"
+
+    def parse_json_response(self, text):
         if not text:
             return None
 
-        text = text.strip()
-        text = re.sub(r"^```json\s*", "", text)
-        text = re.sub(r"^```\s*", "", text)
-        text = re.sub(r"\s*```$", "", text)
+        value = text.strip()
+        value = re.sub(r"^```json\s*", "", value)
+        value = re.sub(r"^```\s*", "", value)
+        value = re.sub(r"\s*```$", "", value)
 
         try:
-            return json.loads(text)
+            return json.loads(value)
         except Exception:
             pass
 
-        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        match = re.search(r"\{.*\}", value, flags=re.DOTALL)
         if match:
             try:
                 return json.loads(match.group(0))
@@ -387,37 +671,75 @@ class GeminiAnalyzer:
 
         return None
 
-    def analyze_diagram(self, diagram, image_bytes, template_expectations):
-        if not self.enabled:
-            return self.heuristic_analysis(diagram, template_expectations)
+    def select_relevant_expectations(self, diagram, expectations):
+        heading = diagram.get("heading", "").lower()
+        context = diagram.get("context_text", "").lower()
+        combined = f"{heading} {context}"
 
-        mime_type = self.detect_mime_type(image_bytes)
-        template_text = json.dumps(template_expectations, indent=2, ensure_ascii=False)[:30000]
+        matched = []
+
+        for expectation in expectations:
+            topic = expectation.get("topic", "")
+            topic_words = [
+                word for word in re.findall(r"[a-zA-Z0-9]+", topic.lower())
+                if len(word) > 3
+            ]
+
+            if any(word in combined for word in topic_words):
+                matched.append(expectation)
+
+        if matched:
+            return matched[:8]
+
+        architecture_related = []
+        for expectation in expectations:
+            topic_lower = expectation.get("topic", "").lower()
+            if any(key in topic_lower for key in [
+                "architecture",
+                "logical",
+                "functional",
+                "integration",
+                "deployment",
+                "security",
+                "database",
+                "network",
+                "environment",
+                "solution",
+                "schematic",
+                "diagram",
+            ]):
+                architecture_related.append(expectation)
+
+        return architecture_related[:10] if architecture_related else expectations[:10]
+
+    def analyze(self, diagram, image_bytes, expectations):
+        relevant_expectations = self.select_relevant_expectations(diagram, expectations)
+
+        if not self.enabled:
+            return self.heuristic_analysis(diagram, relevant_expectations)
 
         prompt = f"""
-You are reviewing a solution design document diagram from Confluence.
+You are reviewing architecture/design diagrams from a Confluence evidence page.
 
-Return only valid JSON. Do not include markdown.
+Return only valid JSON. No markdown.
 
-Evidence diagram information:
-- Diagram ID: {diagram.get("diagram_id")}
-- Heading: {diagram.get("heading")}
-- Nearby evidence text: {diagram.get("context_text")}
+Evidence diagram:
+{json.dumps(diagram, indent=2, ensure_ascii=False)}
 
-Template expectations:
-{template_text}
+Relevant template expectations:
+{json.dumps(relevant_expectations, indent=2, ensure_ascii=False)[:35000]}
 
 Tasks:
-1. Explain the architecture or diagram.
-2. Identify visible components.
-3. Identify visible data flow or control flow.
-4. Identify integrations, dependencies, database, deployment, network, security, and environment details if visible.
-5. Compare the diagram and nearby evidence text with the relevant template expectations.
-6. Mark each required detail as Present, Partially Present, Missing, Unclear, or Not Applicable.
-7. Assess quality using clarity, labeling, flow direction, technical detail, consistency, and review readiness.
-8. Do not assume details that are not visible in the diagram or not mentioned in the evidence text.
+1. Explain the diagram based only on the image and nearby evidence text.
+2. Identify visible architecture components.
+3. Identify visible request flow, data flow, integration flow, or control flow.
+4. Identify database, deployment, environment, network, integration, and security details only if visible or mentioned.
+5. Compare evidence against template expectations.
+6. For every important expected item, mark status as Present, Partially Present, Missing, Unclear, or Not Applicable.
+7. Assess quality using clarity, labeling, flow direction, technical detail, consistency with nearby text, and review readiness.
+8. Do not hallucinate. If something is not visible or not mentioned, mark it Missing or Unclear.
 
-Required JSON schema:
+Return JSON with this schema:
 {{
   "diagram_explanation": "",
   "components_identified": [],
@@ -456,92 +778,72 @@ Required JSON schema:
             contents = [prompt]
 
             if image_bytes:
+                mime_type = self.detect_mime_type(image_bytes)
                 contents.append(types.Part.from_bytes(data=image_bytes, mime_type=mime_type))
 
             response = self.client.models.generate_content(
                 model=self.model,
-                contents=contents
+                contents=contents,
             )
 
-            parsed = self.safe_json_from_text(response.text)
+            parsed = self.parse_json_response(response.text)
             if parsed:
                 return parsed
 
-            fallback = self.heuristic_analysis(diagram, template_expectations)
-            fallback["diagram_explanation"] = response.text[:3000] if response.text else fallback["diagram_explanation"]
+            fallback = self.heuristic_analysis(diagram, relevant_expectations)
+            fallback["diagram_explanation"] = response.text[:4000] if response.text else fallback["diagram_explanation"]
+            fallback["analysis_warning"] = "Gemini response was not valid JSON, fallback structure used."
             return fallback
 
         except Exception as ex:
-            fallback = self.heuristic_analysis(diagram, template_expectations)
+            fallback = self.heuristic_analysis(diagram, relevant_expectations)
             fallback["analysis_error"] = str(ex)
             return fallback
 
-    def detect_mime_type(self, image_bytes):
-        if not image_bytes:
-            return "image/png"
-
-        if image_bytes.startswith(b"\x89PNG"):
-            return "image/png"
-        if image_bytes.startswith(b"\xff\xd8"):
-            return "image/jpeg"
-        if image_bytes.startswith(b"GIF"):
-            return "image/gif"
-        if image_bytes[:4] == b"RIFF" and b"WEBP" in image_bytes[:20]:
-            return "image/webp"
-
-        return "image/png"
-
-    def heuristic_analysis(self, diagram, template_expectations):
+    def heuristic_analysis(self, diagram, expectations):
         heading = diagram.get("heading", "")
         context = diagram.get("context_text", "")
         combined = f"{heading} {context}".lower()
 
         checks = []
-        for expectation in template_expectations:
+
+        for expectation in expectations:
             topic = expectation.get("topic", "")
-            expected_details = expectation.get("expected_details", [])
+            items = expectation.get("expected_details", [])
 
-            topic_key = topic.lower()
-            if topic_key and topic_key in combined:
-                status = "Partially Present" if context else "Unclear"
-            else:
-                status = "Unclear"
+            if not items:
+                items = [topic]
 
-            if expected_details:
-                for item in expected_details[:5]:
-                    item_text = item.lower()
-                    words = [w for w in re.findall(r"[a-zA-Z0-9]+", item_text) if len(w) > 4]
-                    matched = any(word in combined for word in words)
+            for item in items[:8]:
+                item_words = [
+                    word for word in re.findall(r"[a-zA-Z0-9]+", item.lower())
+                    if len(word) >= 5
+                ]
 
-                    checks.append({
-                        "required_detail": f"{topic} - {item[:120]}",
-                        "status": "Partially Present" if matched else "Unclear",
-                        "evidence_found": context[:500] if matched else "",
-                        "missing_details": [] if matched else [item[:200]],
-                        "remarks": "Heuristic check used because Gemini API was not available."
-                    })
-            else:
+                matched_words = [word for word in item_words if word in combined]
+                status = "Partially Present" if matched_words else "Unclear"
+
                 checks.append({
-                    "required_detail": topic,
+                    "required_detail": f"{topic} - {item}",
                     "status": status,
-                    "evidence_found": context[:500] if context else "",
-                    "missing_details": [],
-                    "remarks": "Heuristic check used because Gemini API was not available."
+                    "evidence_found": context[:700] if matched_words else "",
+                    "missing_details": [] if matched_words else [item],
+                    "remarks": "Heuristic check used because Gemini analysis was unavailable.",
                 })
 
         if not checks:
             checks.append({
-                "required_detail": "Template expectation",
+                "required_detail": "Architecture/design details",
                 "status": "Unclear",
-                "evidence_found": context[:500],
+                "evidence_found": context[:700],
                 "missing_details": [],
-                "remarks": "No structured template expectation was extracted."
+                "remarks": "No relevant template expectations were extracted.",
             })
 
         return {
             "diagram_explanation": (
                 f"The diagram is mapped under heading '{heading}'. "
-                f"Gemini analysis was not available, so the explanation is based on nearby Confluence text."
+                "Image-level explanation was not available, so this is based on heading and nearby text only."
             ),
             "components_identified": [],
             "flows_identified": [],
@@ -559,11 +861,11 @@ Required JSON schema:
                 "review_readiness_score": 50,
                 "overall_quality_score": 50,
                 "rating": "Average",
-                "strengths": ["Diagram was found in the evidence page."],
-                "issues": ["Image-level analysis was not available without Gemini."],
-                "recommendations": ["Provide Gemini API key for stronger diagram explanation and quality review."]
+                "strengths": ["Diagram or diagram reference was found in the evidence page."],
+                "issues": ["Gemini image analysis was unavailable or not configured."],
+                "recommendations": ["Configure Gemini API key inside the script for actual diagram explanation and visual quality review."],
             },
-            "confidence": "low"
+            "confidence": "low",
         }
 
 
@@ -572,7 +874,7 @@ class ReportBuilder:
         self.output_json = output_json
         self.output_pdf = output_pdf
 
-    def compute_completeness_score(self, topics):
+    def completeness_score(self, topics):
         score_map = {
             "present": 1.0,
             "partially present": 0.5,
@@ -584,70 +886,74 @@ class ReportBuilder:
         achieved = 0
 
         for topic in topics:
-            checks = topic.get("required_details_check", [])
-            for check in checks:
+            for check in topic.get("required_details_check", []):
                 status = str(check.get("status", "")).strip().lower()
                 if status == "not applicable":
                     continue
-
                 total += 1
                 achieved += score_map.get(status, 0)
 
-        if total == 0:
-            return 0
+        return round((achieved / total) * 100, 2) if total else 0
 
-        return round((achieved / total) * 100, 2)
-
-    def compute_quality_score(self, topics):
-        scores = []
+    def quality_score(self, topics):
+        values = []
 
         for topic in topics:
             quality = topic.get("quality", {})
-            value = quality.get("overall_quality_score")
+            score = quality.get("overall_quality_score")
             try:
-                scores.append(float(value))
+                values.append(float(score))
             except Exception:
                 pass
 
-        if not scores:
-            return 0
+        return round(sum(values) / len(values), 2) if values else 0
 
-        return round(sum(scores) / len(scores), 2)
+    def overall_status(self, completeness, quality):
+        avg = (completeness + quality) / 2
 
-    def overall_status(self, completeness_score, quality_score):
-        average = (completeness_score + quality_score) / 2
-
-        if average >= 85:
+        if avg >= 85:
             return "Excellent"
-        if average >= 70:
+        if avg >= 70:
             return "Good"
-        if average >= 50:
+        if avg >= 50:
             return "Needs Improvement"
         return "Poor"
 
-    def build_json_report(self, evidence_page, template_page, topics, output_dir):
-        completeness_score = self.compute_completeness_score(topics)
-        quality_score = self.compute_quality_score(topics)
+    def escape(self, text):
+        if text is None:
+            return ""
+        value = str(text)
+        value = value.replace("&", "&amp;")
+        value = value.replace("<", "&lt;")
+        value = value.replace(">", "&gt;")
+        return value
+
+    def build_json(self, evidence_page, template_page, topics, output_dir):
+        completeness = self.completeness_score(topics)
+        quality = self.quality_score(topics)
 
         missing_items = []
         recommendations = []
 
         for topic in topics:
             for check in topic.get("required_details_check", []):
-                status = str(check.get("status", "")).lower()
+                status = str(check.get("status", "")).strip().lower()
                 if status in {"missing", "partially present", "unclear"}:
                     missing_items.append({
                         "topic": topic.get("topic_name"),
+                        "diagram_id": topic.get("diagram_id"),
                         "required_detail": check.get("required_detail"),
                         "status": check.get("status"),
+                        "evidence_found": check.get("evidence_found"),
                         "missing_details": check.get("missing_details", []),
-                        "remarks": check.get("remarks", "")
+                        "remarks": check.get("remarks", ""),
                     })
 
-            for recommendation in topic.get("quality", {}).get("recommendations", []):
+            for item in topic.get("quality", {}).get("recommendations", []):
                 recommendations.append({
                     "topic": topic.get("topic_name"),
-                    "recommendation": recommendation
+                    "diagram_id": topic.get("diagram_id"),
+                    "recommendation": item,
                 })
 
         report = {
@@ -657,13 +963,13 @@ class ReportBuilder:
                 "evidence_page_url": evidence_page.get("_source_url", ""),
                 "template_page_url": template_page.get("_source_url", ""),
                 "analysis_date": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                "overall_status": self.overall_status(completeness_score, quality_score),
-                "overall_completeness_score": completeness_score,
-                "overall_quality_score": quality_score
+                "overall_status": self.overall_status(completeness, quality),
+                "overall_completeness_score": completeness,
+                "overall_quality_score": quality,
             },
             "topics": topics,
             "overall_missing_items": missing_items,
-            "overall_recommendations": recommendations
+            "overall_recommendations": recommendations,
         }
 
         output_path = Path(output_dir) / self.output_json
@@ -672,14 +978,17 @@ class ReportBuilder:
 
         return report, output_path
 
-    def p(self, text):
-        if text is None:
-            return ""
-        text = str(text)
-        text = text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
-        return text
+    def pdf_image(self, image_path):
+        img = Image.open(image_path)
+        width, height = img.size
 
-    def build_pdf_report(self, report, output_dir):
+        max_width = 6.5 * inch
+        max_height = 4.4 * inch
+        ratio = min(max_width / width, max_height / height)
+
+        return PdfImage(image_path, width=width * ratio, height=height * ratio)
+
+    def build_pdf(self, report, output_dir):
         output_path = Path(output_dir) / self.output_pdf
 
         doc = SimpleDocTemplate(
@@ -688,170 +997,153 @@ class ReportBuilder:
             rightMargin=36,
             leftMargin=36,
             topMargin=36,
-            bottomMargin=36
+            bottomMargin=36,
         )
 
         styles = getSampleStyleSheet()
         styles.add(ParagraphStyle(
-            name="Small",
+            name="SmallText",
             parent=styles["BodyText"],
             fontSize=8,
             leading=10,
-            alignment=TA_LEFT
+            alignment=TA_LEFT,
         ))
         styles.add(ParagraphStyle(
             name="SectionTitle",
             parent=styles["Heading2"],
             fontSize=14,
             leading=18,
-            spaceAfter=8
+            spaceAfter=8,
         ))
 
         story = []
-
         metadata = report.get("metadata", {})
 
         story.append(Paragraph("Architecture Diagram Review Report", styles["Title"]))
         story.append(Spacer(1, 12))
 
-        summary_data = [
-            ["Evidence Page", self.p(metadata.get("evidence_page_title", ""))],
-            ["Template Page", self.p(metadata.get("template_page_title", ""))],
-            ["Analysis Date", self.p(metadata.get("analysis_date", ""))],
-            ["Overall Status", self.p(metadata.get("overall_status", ""))],
-            ["Completeness Score", str(metadata.get("overall_completeness_score", 0))],
-            ["Quality Score", str(metadata.get("overall_quality_score", 0))]
+        summary_rows = [
+            ["Evidence Page", self.escape(metadata.get("evidence_page_title", ""))],
+            ["Template Page", self.escape(metadata.get("template_page_title", ""))],
+            ["Analysis Date", self.escape(metadata.get("analysis_date", ""))],
+            ["Overall Status", self.escape(metadata.get("overall_status", ""))],
+            ["Completeness Score", str(metadata.get("overall_completeness_score", ""))],
+            ["Quality Score", str(metadata.get("overall_quality_score", ""))],
         ]
 
-        summary_table = Table(summary_data, colWidths=[1.8 * inch, 4.8 * inch])
+        summary_table = Table(summary_rows, colWidths=[1.8 * inch, 4.8 * inch])
         summary_table.setStyle(TableStyle([
-            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F0F2F5")),
-            ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
-            ("VALIGN", (0, 0), (-1, -1), "TOP"),
+            ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F1F5F9")),
+            ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
             ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+            ("VALIGN", (0, 0), (-1, -1), "TOP"),
             ("FONTSIZE", (0, 0), (-1, -1), 9),
-            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
             ("TOPPADDING", (0, 0), (-1, -1), 6),
+            ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
         ]))
         story.append(summary_table)
         story.append(Spacer(1, 18))
 
-        story.append(Paragraph("Overall Missing Items", styles["SectionTitle"]))
-        missing_items = report.get("overall_missing_items", [])
+        story.append(Paragraph("Overall Missing / Unclear Items", styles["SectionTitle"]))
+        missing = report.get("overall_missing_items", [])
 
-        if missing_items:
-            table_rows = [["Topic", "Required Detail", "Status", "Missing / Remarks"]]
-            for item in missing_items[:50]:
+        if missing:
+            rows = [["Topic", "Required Detail", "Status", "Missing / Remarks"]]
+            for item in missing[:70]:
                 missing_text = "; ".join(item.get("missing_details", [])) or item.get("remarks", "")
-                table_rows.append([
-                    Paragraph(self.p(item.get("topic", "")), styles["Small"]),
-                    Paragraph(self.p(item.get("required_detail", "")), styles["Small"]),
-                    Paragraph(self.p(item.get("status", "")), styles["Small"]),
-                    Paragraph(self.p(missing_text), styles["Small"])
+                rows.append([
+                    Paragraph(self.escape(item.get("topic", "")), styles["SmallText"]),
+                    Paragraph(self.escape(item.get("required_detail", "")), styles["SmallText"]),
+                    Paragraph(self.escape(item.get("status", "")), styles["SmallText"]),
+                    Paragraph(self.escape(missing_text), styles["SmallText"]),
                 ])
 
-            table = Table(table_rows, colWidths=[1.2 * inch, 2.1 * inch, 1.0 * inch, 2.3 * inch])
+            table = Table(rows, colWidths=[1.2 * inch, 2.2 * inch, 1.0 * inch, 2.2 * inch])
             table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#D9EAF7")),
-                ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DBEAFE")),
+                ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
                 ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                ("FONTSIZE", (0, 0), (-1, -1), 8),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
+                ("FONTSIZE", (0, 0), (-1, -1), 7),
             ]))
             story.append(table)
         else:
-            story.append(Paragraph("No missing items were identified.", styles["BodyText"]))
+            story.append(Paragraph("No missing or unclear items were identified.", styles["BodyText"]))
 
         story.append(PageBreak())
 
         for topic in report.get("topics", []):
-            story.append(Paragraph(self.p(topic.get("topic_name", "")), styles["Heading1"]))
-            story.append(Paragraph(f"Diagram ID: {self.p(topic.get('diagram_id', ''))}", styles["Small"]))
-            story.append(Paragraph(f"Diagram Available: {self.p(topic.get('diagram_available', ''))}", styles["Small"]))
+            story.append(Paragraph(self.escape(topic.get("topic_name", "")), styles["Heading1"]))
+            story.append(Paragraph(f"Diagram ID: {self.escape(topic.get('diagram_id', ''))}", styles["SmallText"]))
+            story.append(Paragraph(f"Diagram Type: {self.escape(topic.get('diagram_type', ''))}", styles["SmallText"]))
+            story.append(Paragraph(f"Diagram Available: {self.escape(topic.get('diagram_available', ''))}", styles["SmallText"]))
             story.append(Spacer(1, 8))
 
             image_path = topic.get("local_image_path")
             if image_path and os.path.exists(image_path):
                 try:
                     story.append(self.pdf_image(image_path))
-                    story.append(Spacer(1, 8))
+                    story.append(Spacer(1, 10))
                 except Exception:
-                    story.append(Paragraph("Diagram image could not be rendered in PDF.", styles["Small"]))
+                    story.append(Paragraph("Diagram image could not be rendered in PDF.", styles["SmallText"]))
 
             story.append(Paragraph("Diagram Explanation", styles["SectionTitle"]))
-            story.append(Paragraph(self.p(topic.get("diagram_explanation", "")), styles["BodyText"]))
+            story.append(Paragraph(self.escape(topic.get("diagram_explanation", "")), styles["BodyText"]))
             story.append(Spacer(1, 10))
 
-            story.append(Paragraph("Required Details Check", styles["SectionTitle"]))
-
+            story.append(Paragraph("Completeness Check", styles["SectionTitle"]))
             checks = topic.get("required_details_check", [])
+
             if checks:
-                rows = [["Required Detail", "Status", "Evidence Found", "Missing Details / Remarks"]]
-                for check in checks[:40]:
-                    missing = "; ".join(check.get("missing_details", [])) or check.get("remarks", "")
+                rows = [["Required Detail", "Status", "Evidence Found", "Missing / Remarks"]]
+                for check in checks[:50]:
+                    missing_text = "; ".join(check.get("missing_details", [])) or check.get("remarks", "")
                     rows.append([
-                        Paragraph(self.p(check.get("required_detail", "")), styles["Small"]),
-                        Paragraph(self.p(check.get("status", "")), styles["Small"]),
-                        Paragraph(self.p(check.get("evidence_found", "")), styles["Small"]),
-                        Paragraph(self.p(missing), styles["Small"])
+                        Paragraph(self.escape(check.get("required_detail", "")), styles["SmallText"]),
+                        Paragraph(self.escape(check.get("status", "")), styles["SmallText"]),
+                        Paragraph(self.escape(check.get("evidence_found", "")), styles["SmallText"]),
+                        Paragraph(self.escape(missing_text), styles["SmallText"]),
                     ])
 
                 check_table = Table(rows, colWidths=[1.8 * inch, 0.9 * inch, 2.0 * inch, 1.9 * inch])
                 check_table.setStyle(TableStyle([
-                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#E8F5E9")),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DCFCE7")),
                     ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
-                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
                     ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
+                    ("VALIGN", (0, 0), (-1, -1), "TOP"),
                     ("FONTSIZE", (0, 0), (-1, -1), 7),
                 ]))
                 story.append(check_table)
             else:
-                story.append(Paragraph("No required detail checks were generated.", styles["BodyText"]))
+                story.append(Paragraph("No completeness checks were generated.", styles["BodyText"]))
 
             story.append(Spacer(1, 12))
-            story.append(Paragraph("Quality Review", styles["SectionTitle"]))
 
+            story.append(Paragraph("Quality Review", styles["SectionTitle"]))
             quality = topic.get("quality", {})
+
             quality_rows = [
                 ["Overall Quality Score", str(quality.get("overall_quality_score", ""))],
-                ["Rating", self.p(quality.get("rating", ""))],
-                ["Strengths", self.p("; ".join(quality.get("strengths", [])))],
-                ["Issues", self.p("; ".join(quality.get("issues", [])))],
-                ["Recommendations", self.p("; ".join(quality.get("recommendations", [])))]
+                ["Rating", self.escape(quality.get("rating", ""))],
+                ["Strengths", self.escape("; ".join(quality.get("strengths", [])))],
+                ["Issues", self.escape("; ".join(quality.get("issues", [])))],
+                ["Recommendations", self.escape("; ".join(quality.get("recommendations", [])))],
             ]
 
             quality_table = Table(quality_rows, colWidths=[1.8 * inch, 4.8 * inch])
             quality_table.setStyle(TableStyle([
-                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#FFF3CD")),
+                ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#FEF3C7")),
                 ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
-                ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                ("VALIGN", (0, 0), (-1, -1), "TOP"),
                 ("FONTSIZE", (0, 0), (-1, -1), 8),
             ]))
             story.append(quality_table)
+
             story.append(PageBreak())
 
         doc.build(story)
         return output_path
-
-    def pdf_image(self, image_path):
-        img = Image.open(image_path)
-        width, height = img.size
-
-        max_width = 6.4 * inch
-        max_height = 4.5 * inch
-
-        ratio = min(max_width / width, max_height / height)
-        display_width = width * ratio
-        display_height = height * ratio
-
-        return ReportImage(image_path, width=display_width, height=display_height)
-
-
-def sanitize_filename(name):
-    name = name or "diagram"
-    name = re.sub(r"[^a-zA-Z0-9_.-]+", "_", name)
-    return name[:120]
 
 
 def save_image_bytes(image_bytes, output_dir, diagram_id):
@@ -867,6 +1159,7 @@ def save_image_bytes(image_bytes, output_dir, diagram_id):
         path = Path(output_dir) / f"{diagram_id}.{ext}"
         img.save(path)
         return str(path)
+
     except Exception:
         path = Path(output_dir) / f"{diagram_id}.bin"
         with open(path, "wb") as file:
@@ -879,34 +1172,44 @@ def resolve_diagram_image(client, page, attachments, diagram):
     src = diagram.get("image_src")
 
     image_bytes = None
+    image_source = None
 
     if filename:
         image_bytes = client.download_attachment_by_name(page, attachments, filename)
+        if image_bytes:
+            image_source = f"attachment:{filename}"
 
     if not image_bytes and src:
         image_bytes = client.download_url(page, src)
+        if image_bytes:
+            image_source = f"url:{src}"
 
-    return image_bytes
+    return image_bytes, image_source
 
 
-def build_topics(evidence_page, template_expectations, diagrams, analyzer, client, attachments, output_dir):
+def build_topics(evidence_page, expectations, diagrams, analyzer, client, attachments, output_dir):
     topics = []
 
     for diagram in diagrams:
-        image_bytes = resolve_diagram_image(client, evidence_page, attachments, diagram)
+        image_bytes, image_source = resolve_diagram_image(client, evidence_page, attachments, diagram)
         local_image_path = save_image_bytes(image_bytes, output_dir, diagram.get("diagram_id"))
 
-        analysis = analyzer.analyze_diagram(
-            diagram=diagram,
-            image_bytes=image_bytes,
-            template_expectations=template_expectations
-        )
+        analysis = analyzer.analyze(diagram, image_bytes, expectations)
+
+        checks = analysis.get("completeness_checks", [])
+        missing = [
+            check for check in checks
+            if str(check.get("status", "")).lower() in {"missing", "partially present", "unclear"}
+        ]
 
         topic = {
             "topic_name": diagram.get("heading", "Unmapped Diagram"),
             "diagram_id": diagram.get("diagram_id"),
+            "diagram_type": diagram.get("diagram_type"),
+            "macro_name": diagram.get("macro_name"),
             "diagram_heading": diagram.get("heading"),
             "diagram_available": bool(image_bytes),
+            "diagram_image_source": image_source,
             "diagram_attachment_filename": diagram.get("attachment_filename"),
             "diagram_image_src": diagram.get("image_src"),
             "local_image_path": local_image_path,
@@ -918,11 +1221,8 @@ def build_topics(evidence_page, template_expectations, diagrams, analyzer, clien
             "security_details_identified": analysis.get("security_details_identified", []),
             "deployment_details_identified": analysis.get("deployment_details_identified", []),
             "database_details_identified": analysis.get("database_details_identified", []),
-            "required_details_check": analysis.get("completeness_checks", []),
-            "missing_expected_details": [
-                check for check in analysis.get("completeness_checks", [])
-                if str(check.get("status", "")).lower() in {"missing", "partially present", "unclear"}
-            ],
+            "required_details_check": checks,
+            "missing_expected_details": missing,
             "quality": analysis.get("quality", {}),
             "confidence": analysis.get("confidence", ""),
         }
@@ -930,19 +1230,25 @@ def build_topics(evidence_page, template_expectations, diagrams, analyzer, clien
         if "analysis_error" in analysis:
             topic["analysis_error"] = analysis["analysis_error"]
 
+        if "analysis_warning" in analysis:
+            topic["analysis_warning"] = analysis["analysis_warning"]
+
         topics.append(topic)
 
     if not topics:
         topics.append({
             "topic_name": "No Diagram Found",
             "diagram_id": "diagram_000",
+            "diagram_type": "none",
+            "macro_name": "",
             "diagram_heading": "",
             "diagram_available": False,
-            "diagram_attachment_filename": "",
-            "diagram_image_src": "",
+            "diagram_image_source": None,
+            "diagram_attachment_filename": None,
+            "diagram_image_src": None,
             "local_image_path": None,
             "nearby_evidence_text": "",
-            "diagram_explanation": "No diagrams were found in the evidence Confluence page.",
+            "diagram_explanation": "No diagram/image/macro diagram was detected in the evidence Confluence page.",
             "components_identified": [],
             "flows_identified": [],
             "integrations_identified": [],
@@ -954,15 +1260,19 @@ def build_topics(evidence_page, template_expectations, diagrams, analyzer, clien
                     "required_detail": "Architecture or design diagram",
                     "status": "Missing",
                     "evidence_found": "",
-                    "missing_details": ["No image or diagram was extracted from the evidence page."],
-                    "remarks": "Check whether diagrams are embedded as attachments, external images, draw.io macros, or unsupported macros."
+                    "missing_details": [
+                        "No supported diagram was extracted from the evidence page."
+                    ],
+                    "remarks": "Check evidence_storage.html and evidence_attachments.json to confirm whether diagrams are stored as images, draw.io, Gliffy, PlantUML, Mermaid, or another macro.",
                 }
             ],
             "missing_expected_details": [
                 {
                     "required_detail": "Architecture or design diagram",
                     "status": "Missing",
-                    "missing_details": ["No image or diagram was extracted from the evidence page."]
+                    "missing_details": [
+                        "No supported diagram was extracted from the evidence page."
+                    ],
                 }
             ],
             "quality": {
@@ -975,37 +1285,51 @@ def build_topics(evidence_page, template_expectations, diagrams, analyzer, clien
                 "overall_quality_score": 0,
                 "rating": "Poor",
                 "strengths": [],
-                "issues": ["No diagram found."],
-                "recommendations": ["Add architecture or design diagrams to the evidence page."]
+                "issues": ["No diagram was found."],
+                "recommendations": ["Add architecture/design diagrams to the evidence page or extend parser for the exact macro type used."],
             },
-            "confidence": "high"
+            "confidence": "high",
         })
 
     return topics
 
 
-def main():
-    parser = argparse.ArgumentParser()
-    parser.add_argument("--evidence-url", required=True)
-    parser.add_argument("--template-url", required=True)
-    parser.add_argument("--confluence-pat", default=os.getenv("CONFLUENCE_PAT"))
-    parser.add_argument("--gemini-api-key", default=os.getenv("GEMINI_API_KEY"))
-    parser.add_argument("--gemini-model", default="gemini-2.5-flash")
-    parser.add_argument("--output-dir", default="confluence_review_output")
-    parser.add_argument("--output-json", default="architecture_review_report.json")
-    parser.add_argument("--output-pdf", default="architecture_review_report.pdf")
-    args = parser.parse_args()
+def save_debug_file(path, content, binary=False):
+    if binary:
+        with open(path, "wb") as file:
+            file.write(content)
+    else:
+        with open(path, "w", encoding="utf-8") as file:
+            if isinstance(content, str):
+                file.write(content)
+            else:
+                json.dump(content, file, indent=2, ensure_ascii=False)
 
-    if not args.confluence_pat:
-        print("Missing Confluence PAT. Pass --confluence-pat or set CONFLUENCE_PAT.", file=sys.stderr)
+
+def validate_config():
+    if not CONFLUENCE_PAT or CONFLUENCE_PAT == "PASTE_YOUR_CONFLUENCE_PAT_HERE":
+        print("Please paste your Confluence PAT in CONFLUENCE_PAT variable.", file=sys.stderr)
         sys.exit(1)
+
+
+def main():
+    cli = argparse.ArgumentParser()
+    cli.add_argument("--evidence-url", required=True)
+    cli.add_argument("--template-url", required=True)
+    cli.add_argument("--output-dir", default="confluence_review_output")
+    cli.add_argument("--output-json", default="architecture_review_report.json")
+    cli.add_argument("--output-pdf", default="architecture_review_report.pdf")
+
+    args = cli.parse_args()
+
+    validate_config()
 
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    client = ConfluenceClient(args.confluence_pat)
-    parser_obj = ConfluenceParser()
-    analyzer = GeminiAnalyzer(api_key=args.gemini_api_key, model=args.gemini_model)
+    client = ConfluenceClient(CONFLUENCE_PAT)
+    parser = ConfluenceParser()
+    analyzer = GeminiAnalyzer(GEMINI_API_KEY, GEMINI_MODEL)
     report_builder = ReportBuilder(args.output_json, args.output_pdf)
 
     print("Fetching evidence page...")
@@ -1014,70 +1338,66 @@ def main():
     print("Fetching template page...")
     template_page = client.fetch_page(args.template_url)
 
-    evidence_html = parser_obj.page_html(evidence_page)
-    template_html = parser_obj.page_html(template_page)
+    evidence_html = parser.get_html(evidence_page)
+    template_html = parser.get_html(template_page)
+
+    save_debug_file(output_dir / "evidence_page_raw.json", evidence_page)
+    save_debug_file(output_dir / "template_page_raw.json", template_page)
+    save_debug_file(output_dir / "evidence_storage.html", evidence_html)
+    save_debug_file(output_dir / "template_storage.html", template_html)
 
     print("Fetching evidence attachments...")
     evidence_attachments = client.fetch_attachments(evidence_page)
+    save_debug_file(output_dir / "evidence_attachments.json", evidence_attachments)
 
-    print("Extracting diagrams from evidence page...")
-    diagrams = parser_obj.extract_images_with_headings(evidence_html)
+    print("Extracting diagrams...")
+    diagrams = parser.extract_diagrams(evidence_html)
+    save_debug_file(output_dir / "extracted_diagrams.json", diagrams)
 
-    print("Extracting expectations from template page...")
-    template_expectations = parser_obj.extract_template_expectations(template_html)
-
-    template_expectations_path = output_dir / "template_expectations.json"
-    with open(template_expectations_path, "w", encoding="utf-8") as file:
-        json.dump(template_expectations, file, indent=2, ensure_ascii=False)
+    print("Extracting template expectations...")
+    expectations = parser.extract_template_expectations(template_html)
+    save_debug_file(output_dir / "template_expectations.json", expectations)
 
     print("Analyzing diagrams...")
     topics = build_topics(
         evidence_page=evidence_page,
-        template_expectations=template_expectations,
+        expectations=expectations,
         diagrams=diagrams,
         analyzer=analyzer,
         client=client,
         attachments=evidence_attachments,
-        output_dir=output_dir
+        output_dir=output_dir,
     )
 
     print("Generating JSON report...")
-    report, json_path = report_builder.build_json_report(
+    report, json_path = report_builder.build_json(
         evidence_page=evidence_page,
         template_page=template_page,
         topics=topics,
-        output_dir=output_dir
+        output_dir=output_dir,
     )
 
     print("Generating PDF report...")
-    pdf_path = report_builder.build_pdf_report(report, output_dir=output_dir)
+    pdf_path = report_builder.build_pdf(report, output_dir)
 
     print("")
     print("Done.")
     print(f"JSON report: {json_path}")
     print(f"PDF report: {pdf_path}")
-    print(f"Template expectations: {template_expectations_path}")
+    print(f"Evidence raw page: {output_dir / 'evidence_page_raw.json'}")
+    print(f"Template raw page: {output_dir / 'template_page_raw.json'}")
+    print(f"Evidence storage HTML: {output_dir / 'evidence_storage.html'}")
+    print(f"Template storage HTML: {output_dir / 'template_storage.html'}")
+    print(f"Evidence attachments: {output_dir / 'evidence_attachments.json'}")
+    print(f"Extracted diagrams: {output_dir / 'extracted_diagrams.json'}")
+    print(f"Template expectations: {output_dir / 'template_expectations.json'}")
     print(f"Diagrams found: {len(diagrams)}")
     print(f"Gemini enabled: {analyzer.enabled}")
+    print(f"SSL verify: {SSL_VERIFY}")
+    print("Authorization mode: Bearer PAT")
 
 
 if __name__ == "__main__":
     main()
-
-
-pip install requests beautifulsoup4 reportlab pillow google-genai
-
-
-
-python confluence_diagram_review.py ^
-  --evidence-url "YOUR_EVIDENCE_CONFLUENCE_PAGE_URL" ^
-  --template-url "YOUR_TEMPLATE_CONFLUENCE_PAGE_URL" ^
-  --confluence-pat "YOUR_CONFLUENCE_PAT" ^
-  --gemini-api-key "YOUR_GEMINI_API_KEY"
-
-
-
-set CONFLUENCE_PAT=your_pat
-set GEMINI_API_KEY=your_key
-
- confluence_diagram_review.py --evidence-url "..." --template-url "..."
+from io import BytesIO
+from pathlib import Path
