@@ -20,7 +20,6 @@ from reportlab.lib.styles import ParagraphStyle, getSampleStyleSheet
 from reportlab.lib.units import inch
 from reportlab.platypus import (
     Image as PdfImage,
-    PageBreak,
     Paragraph,
     SimpleDocTemplate,
     Spacer,
@@ -134,7 +133,6 @@ class ConfluenceClient:
         bases.append(f"{origin}/rest/api")
 
         unique = []
-
         for base in bases:
             if base not in unique:
                 unique.append(base)
@@ -172,7 +170,6 @@ class ConfluenceClient:
 
         for pattern in patterns:
             match = re.search(pattern, page_url)
-
             if match:
                 return match.group(1)
 
@@ -231,7 +228,6 @@ class ConfluenceClient:
                 page["_api_base"] = api_base
                 page["_page_id"] = str(page.get("id"))
                 page["_source_url"] = page_url
-
                 return page
 
             except Exception as ex:
@@ -331,15 +327,6 @@ class ConfluenceParser:
 
     def get_view_html(self, page):
         return page.get("body", {}).get("view", {}).get("value", "") or ""
-
-    def get_html(self, page):
-        storage_html = self.get_storage_html(page)
-        view_html = self.get_view_html(page)
-
-        if storage_html and view_html:
-            return storage_html + "\n" + view_html
-
-        return storage_html or view_html
 
     def parse_sections(self, html):
         soup = BeautifulSoup(html or "", "html.parser")
@@ -684,7 +671,6 @@ class ConfluenceParser:
 
     def extract_diagrams(self, storage_html, view_html=None):
         all_diagrams = []
-
         all_diagrams.extend(self.extract_diagrams_from_html(storage_html, "storage"))
 
         if view_html:
@@ -762,51 +748,64 @@ class GeminiAnalyzer:
         return None
 
     def select_relevant_expectations(self, diagram, expectations):
-        heading = diagram.get("heading", "").lower()
-        context = diagram.get("context_text", "").lower()
-        combined = f"{heading} {context}"
+        diagram_heading = (diagram.get("heading") or "").strip().lower()
+        diagram_context = (diagram.get("context_text") or "").strip().lower()
+        diagram_text = f"{diagram_heading} {diagram_context}"
 
-        matched = []
+        if not expectations:
+            return []
 
-        for expectation in expectations:
-            topic = expectation.get("topic", "")
-            words = [
+        def normalize_words(text):
+            return {
                 word
-                for word in re.findall(r"[a-zA-Z0-9]+", topic.lower())
+                for word in re.findall(r"[a-zA-Z0-9]+", text.lower())
                 if len(word) > 3
-            ]
+            }
 
-            if any(word in combined for word in words):
-                matched.append(expectation)
+        diagram_words = normalize_words(diagram_text)
 
-        if matched:
-            return matched[:8]
-
-        architecture_related = []
+        exact_matches = []
+        partial_matches = []
 
         for expectation in expectations:
-            topic_lower = expectation.get("topic", "").lower()
+            topic = (expectation.get("topic") or "").strip()
+            topic_lower = topic.lower()
+            topic_words = normalize_words(topic_lower)
 
-            if any(
-                key in topic_lower
-                for key in [
-                    "architecture",
-                    "logical",
-                    "functional",
-                    "integration",
-                    "deployment",
-                    "security",
-                    "database",
-                    "network",
-                    "environment",
-                    "solution",
-                    "schematic",
-                    "diagram",
-                ]
-            ):
-                architecture_related.append(expectation)
+            if not topic_words:
+                continue
 
-        return architecture_related[:10] if architecture_related else expectations[:10]
+            if topic_lower and topic_lower in diagram_text:
+                exact_matches.append(expectation)
+                continue
+
+            common_words = diagram_words.intersection(topic_words)
+
+            if common_words:
+                score = len(common_words) / max(len(topic_words), 1)
+                partial_matches.append((score, expectation))
+
+        if exact_matches:
+            return exact_matches[:3]
+
+        if partial_matches:
+            partial_matches.sort(key=lambda item: item[0], reverse=True)
+            best_score = partial_matches[0][0]
+
+            if best_score >= 0.35:
+                return [item[1] for item in partial_matches if item[0] == best_score][:3]
+
+        return [
+            {
+                "topic": diagram.get("heading", "Diagram Topic"),
+                "expected_details": [
+                    "Diagram should contain the details expected for this specific topic in the template.",
+                    "Diagram should clearly show relevant components, flows, dependencies, and technical details for this topic.",
+                ],
+                "raw_text": "",
+                "source": "fallback_topic_specific",
+            }
+        ]
 
     def analyze(self, diagram, image_bytes, expectations):
         relevant_expectations = self.select_relevant_expectations(diagram, expectations)
@@ -825,12 +824,15 @@ Evidence diagram:
 Relevant template expectations:
 {json.dumps(relevant_expectations, indent=2, ensure_ascii=False)[:35000]}
 
+Important rule:
+Compare this evidence diagram only with the matching template topic shown above. Do not compare it with unrelated template topics.
+
 Tasks:
 1. Explain the diagram based only on the image and nearby evidence text.
 2. Identify visible architecture components.
 3. Identify visible request flow, data flow, integration flow, or control flow.
 4. Identify database, deployment, environment, network, integration, and security details only if visible or mentioned.
-5. Compare evidence against template expectations.
+5. Compare evidence against the matching template topic only.
 6. For every important expected item, mark status as Present, Partially Present, Missing, Unclear, or Not Applicable.
 7. Assess quality using clarity, labeling, flow direction, technical detail, consistency with nearby text, and review readiness.
 8. Do not assume anything. If something is not visible or not mentioned, mark it Missing or Unclear.
@@ -927,7 +929,7 @@ Return JSON with this schema:
                         "status": status,
                         "evidence_found": context[:700] if matched_words else "",
                         "missing_details": [] if matched_words else [item],
-                        "remarks": "Heuristic check used because model analysis was unavailable.",
+                        "remarks": "Heuristic topic-specific check used because model analysis was unavailable.",
                     }
                 )
 
@@ -938,7 +940,7 @@ Return JSON with this schema:
                     "status": "Unclear",
                     "evidence_found": context[:700],
                     "missing_details": [],
-                    "remarks": "No relevant template expectations were extracted.",
+                    "remarks": "No matching template topic was extracted.",
                 }
             )
 
@@ -1044,6 +1046,12 @@ class ReportBuilder:
         missing_items = []
         recommendations = []
 
+        diagram_topics = []
+        for topic in topics:
+            topic_name = topic.get("topic_name", "")
+            if topic_name and topic_name not in diagram_topics:
+                diagram_topics.append(topic_name)
+
         for topic in topics:
             for check in topic.get("required_details_check", []):
                 status = str(check.get("status", "")).strip().lower()
@@ -1080,6 +1088,8 @@ class ReportBuilder:
                 "overall_status": self.overall_status(completeness, quality),
                 "overall_completeness_score": completeness,
                 "overall_quality_score": quality,
+                "total_diagrams": len(topics),
+                "diagram_topics": diagram_topics,
             },
             "topics": topics,
             "overall_missing_items": missing_items,
@@ -1092,22 +1102,6 @@ class ReportBuilder:
             json.dump(report, file, indent=2, ensure_ascii=False)
 
         return report, output_path
-
-    def pdf_image(self, image_path):
-        img = Image.open(image_path)
-        width, height = img.size
-
-        page_width, page_height = landscape(A4)
-
-        max_width = page_width - 80
-        max_height = page_height - 120
-
-        ratio = min(max_width / width, max_height / height)
-
-        display_width = width * ratio
-        display_height = height * ratio
-
-        return PdfImage(image_path, width=display_width, height=display_height)
 
     def build_pdf(self, report, output_dir):
         output_path = Path(output_dir) / self.output_pdf
@@ -1125,47 +1119,69 @@ class ReportBuilder:
 
         styles.add(
             ParagraphStyle(
-                name="SmallText",
+                name="WrappedText",
                 parent=styles["BodyText"],
                 fontSize=8,
                 leading=10,
-            )
-        )
-
-        styles.add(
-            ParagraphStyle(
-                name="SectionTitle",
-                parent=styles["Heading2"],
-                fontSize=14,
-                leading=18,
-                spaceAfter=8,
+                wordWrap="CJK",
             )
         )
 
         story = []
         metadata = report.get("metadata", {})
 
-        story.append(Paragraph("Architecture Diagram Review Report", styles["Title"]))
+        diagram_topics = metadata.get("diagram_topics", [])
+        diagram_topics_text = ", ".join(diagram_topics) if diagram_topics else "No diagram topic found"
+
+        story.append(Paragraph("Architecture Diagram Review Summary", styles["Title"]))
         story.append(Spacer(1, 12))
 
         summary_rows = [
-            ["Evidence Page", self.escape(metadata.get("evidence_page_title", ""))],
-            ["Template Page", self.escape(metadata.get("template_page_title", ""))],
-            ["Analysis Date", self.escape(metadata.get("analysis_date", ""))],
-            ["Overall Status", self.escape(metadata.get("overall_status", ""))],
-            ["Completeness Score", str(metadata.get("overall_completeness_score", ""))],
-            ["Quality Score", str(metadata.get("overall_quality_score", ""))],
+            [
+                "Evidence Page",
+                "Template Page",
+                "Analysis Date",
+                "Overall Status",
+                "Completeness Score",
+                "Quality Score",
+                "Total Diagrams",
+                "Diagram Topics",
+            ],
+            [
+                Paragraph(self.escape(metadata.get("evidence_page_title", "")), styles["WrappedText"]),
+                Paragraph(self.escape(metadata.get("template_page_title", "")), styles["WrappedText"]),
+                Paragraph(self.escape(metadata.get("analysis_date", "")), styles["WrappedText"]),
+                Paragraph(self.escape(metadata.get("overall_status", "")), styles["WrappedText"]),
+                Paragraph(str(metadata.get("overall_completeness_score", "")), styles["WrappedText"]),
+                Paragraph(str(metadata.get("overall_quality_score", "")), styles["WrappedText"]),
+                Paragraph(str(metadata.get("total_diagrams", "")), styles["WrappedText"]),
+                Paragraph(self.escape(diagram_topics_text), styles["WrappedText"]),
+            ],
         ]
 
-        summary_table = Table(summary_rows, colWidths=[2.0 * inch, 7.0 * inch])
+        summary_table = Table(
+            summary_rows,
+            colWidths=[
+                1.35 * inch,
+                1.35 * inch,
+                1.15 * inch,
+                1.0 * inch,
+                1.0 * inch,
+                0.9 * inch,
+                0.8 * inch,
+                2.3 * inch,
+            ],
+            repeatRows=1,
+        )
+
         summary_table.setStyle(
             TableStyle(
                 [
-                    ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#F1F5F9")),
-                    ("GRID", (0, 0), (-1, -1), 0.4, colors.grey),
-                    ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
+                    ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DBEAFE")),
+                    ("GRID", (0, 0), (-1, -1), 0.5, colors.grey),
+                    ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
                     ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                    ("FONTSIZE", (0, 0), (-1, -1), 9),
+                    ("FONTSIZE", (0, 0), (-1, -1), 8),
                     ("TOPPADDING", (0, 0), (-1, -1), 6),
                     ("BOTTOMPADDING", (0, 0), (-1, -1), 6),
                 ]
@@ -1173,138 +1189,6 @@ class ReportBuilder:
         )
 
         story.append(summary_table)
-        story.append(Spacer(1, 18))
-
-        story.append(Paragraph("Overall Missing / Unclear Items", styles["SectionTitle"]))
-
-        missing_items = report.get("overall_missing_items", [])
-
-        if missing_items:
-            rows = [["Topic", "Required Detail", "Status", "Missing / Remarks"]]
-
-            for item in missing_items[:70]:
-                missing_text = "; ".join(item.get("missing_details", [])) or item.get("remarks", "")
-
-                rows.append(
-                    [
-                        Paragraph(self.escape(item.get("topic", "")), styles["SmallText"]),
-                        Paragraph(self.escape(item.get("required_detail", "")), styles["SmallText"]),
-                        Paragraph(self.escape(item.get("status", "")), styles["SmallText"]),
-                        Paragraph(self.escape(missing_text), styles["SmallText"]),
-                    ]
-                )
-
-            table = Table(rows, colWidths=[1.7 * inch, 3.0 * inch, 1.2 * inch, 3.6 * inch])
-            table.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DBEAFE")),
-                        ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
-                        ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                        ("FONTSIZE", (0, 0), (-1, -1), 7),
-                    ]
-                )
-            )
-
-            story.append(table)
-        else:
-            story.append(Paragraph("No missing or unclear items were identified.", styles["BodyText"]))
-
-        story.append(PageBreak())
-
-        for topic in report.get("topics", []):
-            story.append(Paragraph(self.escape(topic.get("topic_name", "")), styles["Heading1"]))
-            story.append(Paragraph(f"Diagram ID: {self.escape(topic.get('diagram_id', ''))}", styles["SmallText"]))
-            story.append(Paragraph(f"Diagram Type: {self.escape(topic.get('diagram_type', ''))}", styles["SmallText"]))
-            story.append(Paragraph(f"HTML Source: {self.escape(topic.get('html_source', ''))}", styles["SmallText"]))
-            story.append(Paragraph(f"Diagram Available: {self.escape(topic.get('diagram_available', ''))}", styles["SmallText"]))
-            story.append(Spacer(1, 8))
-
-            image_path = topic.get("local_image_path")
-
-            if image_path and os.path.exists(image_path):
-                try:
-                    story.append(PageBreak())
-                    story.append(Paragraph("Diagram", styles["SectionTitle"]))
-                    story.append(self.pdf_image(image_path))
-                    story.append(PageBreak())
-                except Exception:
-                    story.append(
-                        Paragraph(
-                            "Diagram image could not be rendered in PDF.",
-                            styles["SmallText"],
-                        )
-                    )
-
-            story.append(Paragraph("Diagram Explanation", styles["SectionTitle"]))
-            story.append(Paragraph(self.escape(topic.get("diagram_explanation", "")), styles["BodyText"]))
-            story.append(Spacer(1, 10))
-
-            story.append(Paragraph("Completeness Check", styles["SectionTitle"]))
-
-            checks = topic.get("required_details_check", [])
-
-            if checks:
-                rows = [["Required Detail", "Status", "Evidence Found", "Missing / Remarks"]]
-
-                for check in checks[:50]:
-                    missing_text = "; ".join(check.get("missing_details", [])) or check.get("remarks", "")
-
-                    rows.append(
-                        [
-                            Paragraph(self.escape(check.get("required_detail", "")), styles["SmallText"]),
-                            Paragraph(self.escape(check.get("status", "")), styles["SmallText"]),
-                            Paragraph(self.escape(check.get("evidence_found", "")), styles["SmallText"]),
-                            Paragraph(self.escape(missing_text), styles["SmallText"]),
-                        ]
-                    )
-
-                check_table = Table(rows, colWidths=[2.4 * inch, 1.2 * inch, 3.0 * inch, 2.9 * inch])
-                check_table.setStyle(
-                    TableStyle(
-                        [
-                            ("BACKGROUND", (0, 0), (-1, 0), colors.HexColor("#DCFCE7")),
-                            ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
-                            ("FONTNAME", (0, 0), (-1, 0), "Helvetica-Bold"),
-                            ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                            ("FONTSIZE", (0, 0), (-1, -1), 7),
-                        ]
-                    )
-                )
-
-                story.append(check_table)
-            else:
-                story.append(Paragraph("No completeness checks were generated.", styles["BodyText"]))
-
-            story.append(Spacer(1, 12))
-            story.append(Paragraph("Quality Review", styles["SectionTitle"]))
-
-            quality = topic.get("quality", {})
-
-            quality_rows = [
-                ["Overall Quality Score", str(quality.get("overall_quality_score", ""))],
-                ["Rating", self.escape(quality.get("rating", ""))],
-                ["Strengths", self.escape("; ".join(quality.get("strengths", [])))],
-                ["Issues", self.escape("; ".join(quality.get("issues", [])))],
-                ["Recommendations", self.escape("; ".join(quality.get("recommendations", [])))],
-            ]
-
-            quality_table = Table(quality_rows, colWidths=[2.0 * inch, 7.0 * inch])
-            quality_table.setStyle(
-                TableStyle(
-                    [
-                        ("BACKGROUND", (0, 0), (0, -1), colors.HexColor("#FEF3C7")),
-                        ("GRID", (0, 0), (-1, -1), 0.35, colors.grey),
-                        ("FONTNAME", (0, 0), (0, -1), "Helvetica-Bold"),
-                        ("VALIGN", (0, 0), (-1, -1), "TOP"),
-                        ("FONTSIZE", (0, 0), (-1, -1), 8),
-                    ]
-                )
-            )
-
-            story.append(quality_table)
-            story.append(PageBreak())
 
         doc.build(story)
 
@@ -1495,9 +1379,7 @@ def build_topics(evidence_page, expectations, diagrams, analyzer, client, attach
                         "required_detail": "Architecture or design diagram",
                         "status": "Missing",
                         "evidence_found": "",
-                        "missing_details": [
-                            "No supported diagram was extracted from the evidence page."
-                        ],
+                        "missing_details": ["No supported diagram was extracted from the evidence page."],
                         "remarks": "Check evidence_storage.html, evidence_view.html and evidence_attachments.json to confirm diagram storage format.",
                     }
                 ],
@@ -1505,9 +1387,7 @@ def build_topics(evidence_page, expectations, diagrams, analyzer, client, attach
                     {
                         "required_detail": "Architecture or design diagram",
                         "status": "Missing",
-                        "missing_details": [
-                            "No supported diagram was extracted from the evidence page."
-                        ],
+                        "missing_details": ["No supported diagram was extracted from the evidence page."],
                     }
                 ],
                 "quality": {
@@ -1628,13 +1508,13 @@ def main():
         output_dir=output_dir,
     )
 
-    print("Generating PDF report...")
+    print("Generating PDF summary report...")
     pdf_path = report_builder.build_pdf(report, output_dir)
 
     print("")
     print("Done.")
     print(f"JSON report: {json_path}")
-    print(f"PDF report: {pdf_path}")
+    print(f"PDF summary report: {pdf_path}")
     print(f"Evidence raw page: {output_dir / 'evidence_page_raw.json'}")
     print(f"Template raw page: {output_dir / 'template_page_raw.json'}")
     print(f"Evidence storage HTML: {output_dir / 'evidence_storage.html'}")
